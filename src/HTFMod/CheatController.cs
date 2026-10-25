@@ -21,12 +21,17 @@ public class CheatController : MonoBehaviour
     private void Start()
     {
         MenuOpen = false;
+
+        // every menu toggle becomes hotkey-capable (bound via right-click popup / Keys tab)
+        foreach (var id in FeatureActions.All)
+            Hotkeys.RegisterToggle(id);
     }
 
     private void Update()
     {
         try
         {
+            Hotkeys.TickToggles();
             Multiplayer.Tick();
             Roulette.Tick();
             Combat.Tick(MenuOpen);
@@ -34,7 +39,7 @@ public class CheatController : MonoBehaviour
             if (Features.ThirdPerson)
                 Features.TickThirdPerson();
 
-            if (InputX.GetKeyDown(KeyCode.Insert))
+            if (InputX.GetKeyDown(Hotkeys.Key(Hotkeys.MenuToggle)))
             {
                 MenuOpen = !MenuOpen;
                 if (MenuOpen)
@@ -46,7 +51,23 @@ public class CheatController : MonoBehaviour
                         _itemsCached = true;
                     }
                 }
+                else
+                {
+                    MenuUi.HandleEscape(); // clear listening/popup state with the menu
+                    Settings.SaveNow(); // leaving the menu — flush slider changes
+                }
             }
+            else if (MenuOpen && InputX.GetKeyDown(KeyCode.Escape))
+            {
+                // Esc layers: cancel listening → close bind popup → close the menu
+                if (!MenuUi.HandleEscape())
+                {
+                    MenuOpen = false;
+                    Settings.SaveNow();
+                }
+            }
+
+            Settings.Tick();
 
             _vitalsTimer += Time.deltaTime;
             if (_vitalsTimer >= 0.4f)
@@ -73,6 +94,11 @@ public class CheatController : MonoBehaviour
         {
             Loader.Log("Update exception: " + e);
         }
+    }
+
+    private void OnApplicationQuit()
+    {
+        Settings.SaveNow();
     }
 
     private void OnGUI()

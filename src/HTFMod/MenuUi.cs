@@ -25,11 +25,15 @@ public static class MenuUi
     private static readonly Color CDanger = new(0.94f, 0.44f, 0.44f, 1f);
 
     private const float WinW = 430f;
-    private const float WinH = 596f;
+
+    /// <summary>Window height: tall enough for the biggest tab on 1080p+,
+    /// shrinks on small screens; the tab scrollview handles any leftover overflow.</summary>
+    private static float WinH => Mathf.Min(740f, Screen.height - 130f);
 
     private static Rect _win = new Rect(80, 80, WinW, WinH);
     private static int _tab;
     private static Vector2 _scroll;
+    private static Vector2 _tabScroll;
 
     private static string[] Tabs => new[]
     {
@@ -39,7 +43,11 @@ public static class MenuUi
         L.T("战斗", "戰鬥", "Combat"),
         L.T("载具", "載具", "Vehicle"),
         L.T("玩乐", "玩樂", "Fun"),
+        L.T("按键", "按鍵", "Keys"),
     };
+
+    // hotkey rebinding: which action is waiting for a key press (null = none)
+    private static string _listening;
 
     private static Font _font;
     private static bool _stylesReady;
@@ -57,6 +65,22 @@ public static class MenuUi
         EnsureFont();
         EnsureStyles();
 
+        // hotkey rebinding: while listening, swallow the next key/mouse press globally
+        HandleBindCapture();
+
+        // bind popup: click outside closes it, Esc closes when not listening
+        if (_bindPopup != null)
+        {
+            var e = Event.current;
+            if (e != null && e.type == EventType.MouseDown && !_bindPopupRect.Contains(e.mousePosition))
+                _bindPopup = null;
+            else if (e != null && e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape && _listening == null)
+            {
+                _bindPopup = null;
+                e.Use();
+            }
+        }
+
         if (c.MenuOpen)
         {
             if (_windowFn == null)
@@ -69,10 +93,336 @@ public static class MenuUi
             DrawHudHint(c);
         }
 
+        DrawBindPopupWindow();
+
         DrawIslandLabels();
         DrawPlayerEsp();
+        DrawCrosshair(c);
         DrawRouletteHud();
         DrawToast(c);
+    }
+
+    /// <summary>
+    /// Crosshair that follows the gun's muzzle ray — the same line the laser sight
+    /// points along — projected to screen. NOT the screen center: where the gun
+    /// points is where bullets go, so the marker sits exactly there.
+    /// </summary>
+    private static void DrawCrosshair(CheatController c)
+    {
+        if (!Features.Crosshair || c.MenuOpen)
+            return;
+        var p = Player.LocalPlayer;
+        if (p == null)
+            return;
+        var held = p.Holding != null ? p.Holding.HeldItem : null;
+        var w = held != null ? held.Weapon : null;
+        if (w == null || w.IsAds)
+            return;
+        var pc = p.Camera;
+        if (pc == null || !pc.MouseLocked)
+            return;
+        var cam = GameInfo.CurCamera;
+        if (cam == null)
+            return;
+
+        Vector2 sp;
+        try
+        {
+            var fp = w.Attachments != null ? w.Attachments.FirePoint : null;
+            Vector3 origin = fp != null ? fp.position : cam.transform.position;
+            Vector3 dir = fp != null ? fp.forward : cam.transform.forward;
+
+            Vector3 world = origin + dir * 250f;
+            if (Physics.Raycast(origin, dir, out var hit, 250f,
+                    GameInfo.ProjectileHitLayer, QueryTriggerInteraction.Ignore))
+                world = hit.point;
+
+            Vector3 s = cam.WorldToScreenPoint(world);
+            if (s.z <= 0.1f)
+                return; // pointing away from the camera view
+            sp = new Vector2(s.x, Screen.height - s.y);
+        }
+        catch
+        {
+            return;
+        }
+
+        float cx = sp.x, cy = sp.y;
+        var prev = GUI.color;
+        GUI.color = new Color(0.95f, 0.97f, 1f, 0.85f);
+        float dot = 2.5f, gap = 5f, len = 7f, t = 1.6f;
+        GUI.DrawTexture(new Rect(cx - dot / 2, cy - dot / 2, dot, dot), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(cx - t / 2, cy - gap - len, t, len), Texture2D.whiteTexture); // up
+        GUI.DrawTexture(new Rect(cx - t / 2, cy + gap, t, len), Texture2D.whiteTexture);       // down
+        GUI.DrawTexture(new Rect(cx - gap - len, cy - t / 2, len, t), Texture2D.whiteTexture); // left
+        GUI.DrawTexture(new Rect(cx + gap, cy - t / 2, len, t), Texture2D.whiteTexture);       // right
+        GUI.color = prev;
+    }
+
+    // ────────────────────────── bind popup (neverlose style) ──────────────────────────
+
+    private static string[] _bindPopup;      // actions shown in the popup
+    private static string _bindPopupTitle;
+    private static Rect _bindPopupRect = new Rect(200, 200, 230, 100);
+    private static GUI.WindowFunction _bindPopupFn;
+
+    private static void OpenBindPopup(string[] actions, Vector2 winLocalMouse)
+    {
+        _bindPopup = actions;
+        _bindPopupTitle = BindTitle(actions);
+        bool hasColor = GetActionColor(actions[0]) >= 0;
+        float h = 30 + actions.Length * 30 + (hasColor ? 140 : 0) + 34;
+        _bindPopupRect = new Rect(_win.x + winLocalMouse.x + 8, _win.y + winLocalMouse.y + 8, 230, h);
+        _listening = null;
+        _pickDrag = 0;
+        _pvSyncColor = -1; // force picker resync to this action's color
+    }
+
+    /// <summary>Actions that own an ESP color (packed 0xRRGGBB); -1 = none.</summary>
+    private static int GetActionColor(string action)
+    {
+        if (action == "PlayerEsp") return Features.EspBoxColor;
+        if (action == "PlayerSkeleton") return Features.EspSkeletonColor;
+        return -1;
+    }
+
+    private static void SetActionColor(string action, int rgb)
+    {
+        if (action == "PlayerEsp") Features.EspBoxColor = rgb;
+        else if (action == "PlayerSkeleton") Features.EspSkeletonColor = rgb;
+        Settings.MarkDirty();
+    }
+
+    private static string BindTitle(string[] actions)
+    {
+        return ActionLabel(actions[0]);
+    }
+
+    private static void DrawBindPopupWindow()
+    {
+        if (_bindPopup == null)
+            return;
+        if (_bindPopupFn == null)
+            _bindPopupFn = id => BindPopupFunc(id);
+        _bindPopupRect = GUI.Window(0x485447, _bindPopupRect, _bindPopupFn, "", _panel);
+        _bindPopupRect.x = Mathf.Clamp(_bindPopupRect.x, 4, Screen.width - _bindPopupRect.width - 4);
+        _bindPopupRect.y = Mathf.Clamp(_bindPopupRect.y, 4, Screen.height - _bindPopupRect.height - 4);
+    }
+
+    private static void BindPopupFunc(int id)
+    {
+        var w = _bindPopupRect;
+        GUI.DragWindow(new Rect(0, 0, w.width, 22));
+
+        GUI.Label(new Rect(10, 5, w.width - 20, 20), _bindPopupTitle, _title);
+        float y = 28;
+        foreach (var a in _bindPopup)
+        {
+            GUI.Label(new Rect(10, y + 5, 96, 20), ActionLabel(a), _label);
+            bool listening = _listening == a;
+            string txt = listening
+                ? L.T("按任意键…", "按任意鍵…", "Press any key…")
+                : KeyName(Hotkeys.Key(a));
+            if (GUI.Button(new Rect(w.width - 122, y + 2, 112, 24), txt, listening ? _btnAccent : _btn))
+            {
+                if (listening)
+                    _listening = null; // click again while listening → cancel
+                else if (_listening == null)
+                    _listening = a;
+            }
+            y += 30;
+        }
+
+        // clear all binds shown in this popup
+        if (GUI.Button(new Rect(10, y + 1, 92, 22), L.T("清除绑定", "清除綁定", "Clear binds"), _btn))
+        {
+            foreach (var a in _bindPopup)
+                Hotkeys.Set(a, KeyCode.None);
+            _listening = null;
+        }
+
+        // HSV color picker for color-capable actions (presets + SV square + hue bar)
+        if (GetActionColor(_bindPopup[0]) >= 0)
+            DrawColorPicker(_bindPopup[0], y + 30, w.width - 20);
+
+        GUI.Label(new Rect(110, y + 5, w.width - 120, 18),
+            L.T("点击按钮后按新键 · Esc 取消", "點擊按鈕後按新鍵 · Esc 取消", "Click a button, press the new key · Esc cancels"), _hint);
+    }
+
+    // ────────────────── HSV color picker ──────────────────
+
+    private static Texture2D _svTex, _hueTex;
+    private static float _pvH, _pvS, _pvV;
+    private static float _pickerH = -1f; // hue the SV texture was last built for
+    private static int _pvSyncColor = -1;
+    private static int _pickDrag; // 0 none, 1 hue bar, 2 SV square
+
+    private static void EnsurePickerTextures()
+    {
+        if (_hueTex != null)
+            return;
+        _hueTex = new Texture2D(64, 1, TextureFormat.RGBA32, false);
+        for (int x = 0; x < 64; x++)
+            _hueTex.SetPixel(x, 0, Color.HSVToRGB(x / 63f, 1f, 1f));
+        _hueTex.Apply();
+        _hueTex.wrapMode = TextureWrapMode.Clamp;
+        _hueTex.hideFlags = HideFlags.HideAndDontSave;
+    }
+
+    private static void BuildSvTexture()
+    {
+        if (_svTex == null)
+        {
+            _svTex = new Texture2D(64, 64, TextureFormat.RGBA32, false);
+            _svTex.wrapMode = TextureWrapMode.Clamp;
+            _svTex.hideFlags = HideFlags.HideAndDontSave;
+            _pickerH = -1f;
+        }
+        if (Mathf.Approximately(_pickerH, _pvH))
+            return;
+        _pickerH = _pvH;
+        for (int y = 0; y < 64; y++)
+            for (int x = 0; x < 64; x++)
+                _svTex.SetPixel(x, y, Color.HSVToRGB(_pvH, x / 63f, 1f - y / 63f));
+        _svTex.Apply();
+    }
+
+    private static void ApplyPicker(string act)
+    {
+        var c = Color.HSVToRGB(_pvH, _pvS, _pvV);
+        int packed = (Mathf.RoundToInt(Mathf.Clamp01(c.r) * 255) << 16)
+                   | (Mathf.RoundToInt(Mathf.Clamp01(c.g) * 255) << 8)
+                   | Mathf.RoundToInt(Mathf.Clamp01(c.b) * 255);
+        SetActionColor(act, packed);
+        _pvSyncColor = packed;
+    }
+
+    private static void DrawColorPicker(string act, float y, float width)
+    {
+        int packed = GetActionColor(act);
+        if (packed != _pvSyncColor)
+        {
+            var c = EspColor(packed);
+            Color.RGBToHSV(new Color(c.r, c.g, c.b), out _pvH, out _pvS, out _pvV);
+            _pvSyncColor = packed;
+        }
+        EnsurePickerTextures();
+        BuildSvTexture();
+
+        float cy = y;
+
+        // preset swatches
+        float sw = 22;
+        for (int i = 0; i < Palette.Length; i++)
+        {
+            var sr = new Rect(10 + i * (sw + 5), cy, sw, 18);
+            var prev = GUI.color;
+            GUI.color = new Color(((Palette[i] >> 16) & 255) / 255f, ((Palette[i] >> 8) & 255) / 255f, (Palette[i] & 255) / 255f);
+            GUI.DrawTexture(sr, Texture2D.whiteTexture);
+            GUI.color = prev;
+            if (Event.current.type == EventType.MouseDown && sr.Contains(Event.current.mousePosition))
+            {
+                SetActionColor(act, Palette[i]);
+                Event.current.Use();
+            }
+        }
+        cy += 26;
+
+        // saturation/value square
+        var svRect = new Rect(10, cy, width, 84);
+        GUI.DrawTexture(svRect, _svTex);
+        cy += svRect.height + 5;
+
+        // hue bar
+        var hueRect = new Rect(10, cy, width, 12);
+        GUI.DrawTexture(hueRect, _hueTex);
+
+        // interaction
+        var e = Event.current;
+        if (e.type == EventType.MouseDown)
+        {
+            if (svRect.Contains(e.mousePosition)) { _pickDrag = 2; e.Use(); }
+            else if (hueRect.Contains(e.mousePosition)) { _pickDrag = 1; e.Use(); }
+        }
+        else if (e.type == EventType.MouseDrag && _pickDrag != 0)
+        {
+            e.Use();
+        }
+        else if (e.type == EventType.MouseUp && _pickDrag != 0)
+        {
+            _pickDrag = 0;
+            e.Use();
+        }
+
+        if (_pickDrag == 2)
+        {
+            _pvS = Mathf.Clamp01((e.mousePosition.x - svRect.x) / svRect.width);
+            _pvV = Mathf.Clamp01(1f - (e.mousePosition.y - svRect.y) / svRect.height);
+            ApplyPicker(act);
+        }
+        else if (_pickDrag == 1)
+        {
+            _pvH = Mathf.Clamp01((e.mousePosition.x - hueRect.x) / hueRect.width);
+            ApplyPicker(act);
+        }
+
+        // position indicators
+        DrawEspOutline(new Rect(svRect.x + _pvS * svRect.width - 3, svRect.y + (1f - _pvV) * svRect.height - 3, 6, 6), Color.white);
+        DrawEspOutline(new Rect(hueRect.x + _pvH * hueRect.width - 2, hueRect.y - 1, 4, hueRect.height + 2), Color.white);
+    }
+
+    /// <summary>Esc layering while the menu is open: cancel listening → close the
+    /// bind popup → (caller closes the menu). Returns true when a layer was closed.</summary>
+    public static bool HandleEscape()
+    {
+        if (_listening != null)
+        {
+            _listening = null;
+            return true;
+        }
+        if (_bindPopup != null)
+        {
+            _bindPopup = null;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Global capture for the "press any key" state (works for both the
+    /// Keys tab and the right-click popup, inside or outside the menu window).</summary>
+    private static void HandleBindCapture()
+    {
+        if (_listening == null)
+            return;
+        var ev = Event.current;
+        if (ev == null)
+            return;
+        if (ev.type == EventType.KeyDown && ev.keyCode != KeyCode.None)
+        {
+            if (ev.keyCode != KeyCode.Escape)
+                Hotkeys.Set(_listening, ev.keyCode);
+            _listening = null;
+            ev.Use();
+        }
+        else if (ev.type == EventType.MouseDown)
+        {
+            // Inside the bind popup only LEFT clicks are UI interaction (buttons);
+            // middle/right clicks still count as key captures (scroll-wheel binds).
+            if (ev.button == 0 && _bindPopup != null && _bindPopupRect.Contains(ev.mousePosition))
+                return;
+
+            KeyCode mk = ev.button switch
+            {
+                0 => KeyCode.Mouse0,
+                1 => KeyCode.Mouse1,
+                2 => KeyCode.Mouse2,
+                _ => KeyCode.None,
+            };
+            if (mk != KeyCode.None)
+                Hotkeys.Set(_listening, mk);
+            _listening = null;
+            ev.Use();
+        }
     }
 
     // ────────────────────────── island labels ──────────────────────────
@@ -200,9 +550,28 @@ public static class MenuUi
 
     // ────────────────────────── player ESP ──────────────────────────
 
+    /// <summary>ESP preset palette (packed 0xRRGGBB, picked via swatches in the bind popup).</summary>
+    private static readonly int[] Palette =
+    {
+        0xF24C4C, // red
+        0x4CE65E, // green
+        0x5C8DF2, // blue
+        0x3DE0D1, // teal
+        0xF2994C, // orange
+        0xCC73F2, // purple
+        0xF2DB4C, // yellow
+        0xF2F2F2, // white
+    };
+
+    private static Color EspColor(int rgb)
+    {
+        return new Color(((rgb >> 16) & 255) / 255f, ((rgb >> 8) & 255) / 255f, (rgb & 255) / 255f, 0.9f);
+    }
+
     private static void DrawPlayerEsp()
     {
-        if (!Features.PlayerEsp)
+        bool any = Features.PlayerEsp || Features.PlayerSkeleton || Features.PlayerHealth;
+        if (!any)
             return;
         var cam = GameInfo.CurCamera;
         if (cam == null || Player.LocalPlayer == null)
@@ -232,20 +601,119 @@ public static class MenuUi
                 float w = Mathf.Clamp(h * 0.45f, 10f, 220f);
                 var r = new Rect(sh.x - w / 2f, top, w, h);
 
-                DrawEspOutline(r);
+                if (Features.PlayerSkeleton)
+                    DrawSkeleton(pl, cam);
 
-                string name = (pl.SteamName ?? L.T("玩家", "玩家", "Player")).Replace("<", "");
-                GUI.Label(new Rect(r.x - 40, r.y - 20, r.width + 80, 18),
-                    $"<color=#FF6B6B>{name}  {sh.z:0}m</color>", _label);
+                if (Features.PlayerEsp)
+                {
+                    DrawEspOutline(r, EspColor(Features.EspBoxColor));
+
+                    string name = (pl.SteamName ?? L.T("玩家", "玩家", "Player")).Replace("<", "");
+                    GUI.Label(new Rect(r.x - 40, r.y - 20, r.width + 80, 18),
+                        $"<color=#{ColorUtility.ToHtmlStringRGB(EspColor(Features.EspBoxColor))}>{name}  {sh.z:0}m</color>", _label);
+                }
+
+                if (Features.PlayerHealth)
+                    DrawHealthBar(r, GetHealth(pl));
             }
             catch { /* player just left, ignore */ }
         }
     }
 
-    private static void DrawEspOutline(Rect r)
+    /// <summary>Health (0-100) of a player; -1 when unavailable.</summary>
+    private static int GetHealth(Player pl)
+    {
+        try { return pl.Vitals != null ? pl.Vitals._syncedHealth.Value : -1; }
+        catch { return -1; }
+    }
+
+    /// <summary>Small health bar floating above the box, green→red by remaining HP.</summary>
+    private static void DrawHealthBar(Rect box, int health)
+    {
+        if (health < 0)
+            return;
+        float w = Mathf.Max(box.width * 0.7f, 30f);
+        float h = 4f;
+        float x = box.center.x - w / 2f;
+        float y = box.y - 10f;
+        DrawFill(new Rect(x - 1, y - 1, w + 2, h + 2), new Color(0, 0, 0, 0.7f));
+        float frac = Mathf.Clamp01(health / 100f);
+        var col = Color.Lerp(new Color(0.92f, 0.25f, 0.25f), new Color(0.30f, 0.90f, 0.35f), frac);
+        if (frac > 0.001f)
+            DrawFill(new Rect(x, y, w * frac, h), col);
+    }
+
+    /// <summary>Skeleton ESP: a line from every bone to its parent bone (any rig).</summary>
+    private static void DrawSkeleton(Player pl, Camera cam)
+    {
+        try
+        {
+            var body = pl.Body;
+            if (body == null)
+                return;
+            var newChar = AccessTools.Field(typeof(PlayerBody), "_newCharacter")?.GetValue(body) as GameObject;
+            if (newChar == null || !newChar.activeInHierarchy)
+                return;
+            var smr = newChar.GetComponentInChildren<SkinnedMeshRenderer>();
+            if (smr == null)
+                return;
+            var bones = smr.bones;
+            if (bones == null || bones.Length == 0)
+                return;
+
+            var boneSet = new HashSet<Transform>(bones);
+            var col = EspColor(Features.EspSkeletonColor);
+            var prev = GUI.color;
+            GUI.color = col;
+
+            foreach (var bone in bones)
+            {
+                if (bone == null || bone.parent == null || !boneSet.Contains(bone.parent))
+                    continue;
+
+                Vector3 sa = cam.WorldToScreenPoint(bone.position);
+                Vector3 sb = cam.WorldToScreenPoint(bone.parent.position);
+                if (sa.z <= 0.1f || sb.z <= 0.1f)
+                    continue;
+
+                DrawLine(new Vector2(sa.x, Screen.height - sa.y),
+                         new Vector2(sb.x, Screen.height - sb.y), col);
+            }
+
+            GUI.color = prev;
+        }
+        catch { }
+    }
+
+    private static Material _lineMat;
+
+    /// <summary>1px GL line in GUI pixel space (IMGUI has no line primitive).</summary>
+    private static void DrawLine(Vector2 a, Vector2 b, Color c)
+    {
+        if (_lineMat == null)
+        {
+            _lineMat = new Material(Shader.Find("Hidden/Internal-Colored"));
+            _lineMat.hideFlags = HideFlags.HideAndDontSave;
+            _lineMat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            _lineMat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            _lineMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+            _lineMat.SetInt("_ZWrite", 0);
+        }
+        _lineMat.SetPass(0);
+        GL.PushMatrix();
+        GL.LoadPixelMatrix();
+        GL.Begin(GL.LINES);
+        GL.Color(c);
+        GL.Vertex3(a.x, a.y, 0);
+        GL.Vertex3(b.x, b.y, 0);
+        GL.End();
+        GL.PopMatrix();
+    }
+
+    private static void DrawEspOutline(Rect r, Color color)
     {
         var prev = GUI.color;
-        GUI.color = new Color(1f, 0.35f, 0.35f, 0.9f);
+        GUI.color = color;
         const float t = 1.5f;
         GUI.DrawTexture(new Rect(r.x, r.y, r.width, t), Texture2D.whiteTexture);
         GUI.DrawTexture(new Rect(r.x, r.yMax - t, r.width, t), Texture2D.whiteTexture);
@@ -352,9 +820,10 @@ public static class MenuUi
 
         y += 34;
 
-        // content
+        // content (scrollable — tabs may exceed the window height)
         var content = new Rect(0, y, w.width, w.height - y - 26);
         GUILayout.BeginArea(content);
+        _tabScroll = GUILayout.BeginScrollView(_tabScroll, GUILayout.ExpandHeight(true), GUILayout.ExpandWidth(true));
         switch (_tab)
         {
             case 0: TabPlayer(c); break;
@@ -363,7 +832,9 @@ public static class MenuUi
             case 3: TabCombat(c); break;
             case 4: TabBoat(c); break;
             case 5: TabFun(c); break;
+            case 6: TabKeys(c); break;
         }
+        GUILayout.EndScrollView();
         GUILayout.EndArea();
 
         // bottom bar: hint (left) + language dropdown (right)
@@ -443,35 +914,23 @@ public static class MenuUi
         BeginSection(L.T("生存", "生存", "Survival"));
         ToggleRow(L.T("上帝模式", "上帝模式", "God Mode"),
             L.T("免疫所有伤害(火/毒/溺水/攻击)", "免疫所有傷害(火/毒/溺水/攻擊)", "Immune to all damage (fire/poison/drowning/attacks)"),
-            Features.GodMode, true, v =>
-        {
-            Features.GodMode = v;
-            if (!Features.IsHost)
-                Features.HostAct(CheatAction.GodSelf, flag: v);
-        });
+            Features.GodMode, true, v => FeatureActions.Apply("GodMode", v),
+            new[] { "GodMode" });
         ToggleRow(L.T("锁满饱食度", "鎖滿飽食度", "Fullness Lock"),
             L.T("不掉饱食 / 中毒 / 着火", "不掉飽食 / 中毒 / 著火", "No hunger, poison or fire"),
-            Features.FullnessLock, Features.CanHostAct, v =>
-        {
-            if (Features.IsHost)
-                Features.FullnessLock = v;
-            else if (Features.HostAct(CheatAction.VitalsLock, flag: v))
-                Features.FullnessLock = v;
-        });
+            Features.FullnessLock, Features.CanHostAct, v => FeatureActions.Apply("FullnessLock", v),
+            new[] { "FullnessLock" });
         ToggleRow(L.T("保留物品栏", "保留物品欄", "Keep Inventory"),
             L.T("死亡/复活不掉落物品", "死亡/復活不掉落物品", "No item drops on death/respawn"),
-            Features.KeepInventory, true, v =>
-        {
-            Features.KeepInventory = v;
-            if (!Features.IsHost)
-                Features.HostAct(CheatAction.KeepInventorySelf, flag: v);
-        });
+            Features.KeepInventory, true, v => FeatureActions.Apply("KeepInventory", v),
+            new[] { "KeepInventory" });
         EndSection();
 
         BeginSection(L.T("运动", "運動", "Movement"));
         ToggleRow(L.T("玩家飞行", "玩家飛行", "Player Flight"),
             L.T("Space 升 / Ctrl 降,悬停;开船时自动让位", "Space 升 / Ctrl 降,懸停;開船時自動讓位", "Space up / Ctrl down, hover; yields while driving"),
-            Features.PlayerFlight, true, v => Features.PlayerFlight = v);
+            Features.PlayerFlight, true, v => FeatureActions.Apply("PlayerFlight", v),
+            new[] { "PlayerFlight", Hotkeys.PlayerFlightUp, Hotkeys.PlayerFlightDown });
         SliderRow(L.T("移速倍率", "移速倍率", "Speed"), ref Features.SpeedMult, 0.3f, 5f, "x");
         SliderRow(L.T("跳跃倍率", "跳躍倍率", "Jump"), ref Features.JumpMult, 0.3f, 5f, "x");
         EndSection();
@@ -479,11 +938,8 @@ public static class MenuUi
         BeginSection(L.T("视觉", "視覺", "Visual"));
         ToggleRow(L.T("第三人称", "第三人稱", "Third Person"),
             L.T("相机拉到角色身后跟随视角", "相機拉到角色身後跟隨視角", "Camera follows behind your character"),
-            Features.ThirdPerson, true, v =>
-        {
-            Features.ThirdPerson = v;
-            Features.SetLocalBodyVisible(v);
-        });
+            Features.ThirdPerson, true, v => FeatureActions.Apply("ThirdPerson", v),
+            new[] { "ThirdPerson" });
         SliderRow(L.T("第三人称距离", "第三人稱距離", "TP Distance"), ref Features.ThirdPersonDist, 0.5f, 8f, "m");
         SliderRow(L.T("FOV 倍率", "FOV 倍率", "FOV"), ref Features.FovMult, 0.5f, 2f, "x");
         EndSection();
@@ -494,9 +950,12 @@ public static class MenuUi
     private static void TabMoney(CheatController c)
     {
         BeginSection(L.T("钱包", "錢包", "Wallet"));
-        GUI.Label(new Rect(0, _y, 200, 20), L.T("现金", "現金", "Cash") + $"  <color=#3DE0D1>${MoneyManager.Money:N0}</color>", _label);
-        GUI.Label(new Rect(0, _y + 22, 200, 20), L.T("欧元", "歐元", "Euros") + $"  <color=#3DE0D1>€{MoneyManager.Euro:N0}</color>", _label);
-        _y += 48;
+        if (!_fold)
+        {
+            GUI.Label(new Rect(0, _y, 200, 20), L.T("现金", "現金", "Cash") + $"  <color=#3DE0D1>${MoneyManager.Money:N0}</color>", _label);
+            GUI.Label(new Rect(0, _y + 22, 200, 20), L.T("欧元", "歐元", "Euros") + $"  <color=#3DE0D1>€{MoneyManager.Euro:N0}</color>", _label);
+            _y += 48;
+        }
         EndSection();
 
         BeginSection(L.T("加钱", "加錢", "Add Money"));
@@ -514,7 +973,8 @@ public static class MenuUi
         BeginSection(L.T("开关", "開關", "Toggles"));
         ToggleRow(L.T("秒杀", "秒殺", "One Shot"),
             L.T("自己打出的伤害固定为 100000", "自己打出的傷害固定為 100000", "Your attacks deal a fixed 100000 damage"),
-            Features.SelfOneShot, true, v => Features.SelfOneShot = v);
+            Features.SelfOneShot, true, v => FeatureActions.Apply("SelfOneShot", v),
+            new[] { "SelfOneShot" });
         ToggleRow(L.T("游戏内置作弊", "遊戲內置作弊", "Built-in Cheats"),
             L.T("启用后 M=+$99999 / N=-$99999 / Ctrl+M=+€999", "啟用後 M=+$99999 / N=-$99999 / Ctrl+M=+€999", "Enables M=+$99999 / N=-$99999 / Ctrl+M=+€999"),
             Features.BuiltInCheats, Features.CanHostAct, v =>
@@ -526,7 +986,7 @@ public static class MenuUi
                     ? L.T("内置作弊已启用 (M/N 键)", "內置作弊已啟用 (M/N 鍵)", "Built-in cheats ON (M/N keys)")
                     : L.T("内置作弊已关闭", "內置作弊已關閉", "Built-in cheats OFF"));
             }
-        });
+        }, new[] { "BuiltInCheats" });
         EndSection();
     }
 
@@ -539,7 +999,8 @@ public static class MenuUi
 
         BeginSection(L.T("生成选项", "生成選項", "Spawn Options"));
         SliderRow(L.T("巨型倍率", "巨型倍率", "Giant Weight"), ref Features.GiantWeight, 1f, 50f, "x");
-        ToggleRowInline(L.T("闪亮鱼", "閃亮魚", "Drip Fish"), Features.DripSpawn, v => Features.DripSpawn = v);
+        ToggleRowInline(L.T("闪亮鱼", "閃亮魚", "Drip Fish"), Features.DripSpawn,
+            v => FeatureActions.Apply("DripSpawn", v), new[] { "DripSpawn" });
         EndSection();
 
         // search
@@ -629,32 +1090,60 @@ public static class MenuUi
         BeginSection(L.T("射击", "射擊", "Shooting"));
         ToggleRow(L.T("无后座", "無後座", "No Recoil"),
             L.T("视角与枪模都不再抖动", "視角與槍模都不再抖動", "No view or gun-model kick"),
-            Features.NoRecoil, true, v => Features.NoRecoil = v);
+            Features.NoRecoil, true, v => FeatureActions.Apply("NoRecoil", v),
+            new[] { "NoRecoil" });
         ToggleRow(L.T("无扩散", "無擴散", "No Spread"),
             L.T("散布归零,子弹沿枪口直线飞出(与镭射一致)", "散佈歸零,子彈沿槍口直線飛出(與鐳射一致)", "Zero spread; bullets fly straight along the muzzle (matches the laser)"),
-            Features.NoSpread, true, v => Features.NoSpread = v);
+            Features.NoSpread, true, v => FeatureActions.Apply("NoSpread", v),
+            new[] { "NoSpread" });
         ToggleRow(L.T("无限子弹", "無限子彈", "Infinite Ammo"),
-            L.T("弹匣永远满,无需换弹", "彈匣永遠滿,無需換彈", "Magazine always full, no reloading"),
-            Features.InfiniteAmmo, true, v => Features.InfiniteAmmo = v);
+            L.T("弹匣永远满,自动跳过换弹动作", "彈匣永遠滿,自動跳過換彈動作", "Magazine always full, reloads are skipped"),
+            Features.InfiniteAmmo, true, v => FeatureActions.Apply("InfiniteAmmo", v),
+            new[] { "InfiniteAmmo" });
+        ToggleRow(L.T("快速射击", "快速射擊", "Fast Fire"),
+            L.T("所有枪械按下方倍率提升射速", "所有槍械按下方倍率提升射速", "All guns fire at the multiplier rate below"),
+            Features.FastFire, true, v => FeatureActions.Apply("FastFire", v),
+            new[] { "FastFire" });
+        SliderRow(L.T("射速倍率", "射速倍率", "Fire Rate"), ref Features.FireRateMult, 1f, 10f, "x");
+        OptionRow(L.T("开火模式", "開火模式", "Fire Mode"),
+            new[]
+            {
+                L.T("点击", "點擊", "Click"),
+                L.T("长按", "長按", "Hold"),
+                L.T("长按+点击", "長按+點擊", "Hold+Click"),
+            },
+            ref Features.FireMode);
         EndSection();
 
         BeginSection(L.T("自瞄", "自瞄", "Aimbot"));
         ToggleRow(L.T("自瞄玩家", "自瞄玩家", "Aim Players"),
-            L.T("按住右键瞄准时自动跟踪其他玩家", "按住右鍵瞄準時自動跟蹤其他玩家", "Auto-track other players while holding RMB"),
-            Features.Aimbot, true, v => Features.Aimbot = v);
+            L.T("按住触发键自动跟踪其他玩家(默认右键,右键行可改绑)", "按住觸發鍵自動跟蹤其他玩家(預設右鍵,右鍵行可改綁)", "Auto-track other players while the trigger is held (default RMB, right-click the row to rebind)"),
+            Features.Aimbot, true, v => FeatureActions.Apply("Aimbot", v),
+            new[] { "Aimbot", Hotkeys.AimbotTrigger });
         SliderRow(L.T("自瞄强度", "自瞄強度", "Aim Strength"), ref Features.AimbotStrength, 0.1f, 1f, "");
         SliderRow(L.T("瞄准范围", "瞄準範圍", "Aim Range"), ref Features.AimbotMaxAngle, 5f, 90f, "°");
-        GUILayout.Label(
-            L.T("按住右键瞄准时锁定离准星最近的玩家并持续跟踪,打死或目标离开范围才换目标。",
+        Hint(L.T("按住右键瞄准时锁定离准星最近的玩家并持续跟踪,打死或目标离开范围才换目标。",
                 "按住右鍵瞄準時鎖定離準星最近的玩家並持續跟蹤,打死或目標離開範圍才換目標。",
-                "Hold RMB to lock the player nearest the crosshair and keep tracking; the target only changes after it dies or leaves range."),
-            _labelDim);
+                "Hold RMB to lock the player nearest the crosshair and keep tracking; the target only changes after it dies or leaves range."));
         EndSection();
 
         BeginSection(L.T("透视", "透視", "ESP"));
         ToggleRow(L.T("玩家透视", "玩家透視", "Player ESP"),
-            L.T("隔墙显示其他玩家的框与距离", "隔牆顯示其他玩家的框與距離", "Boxes and distance through walls"),
-            Features.PlayerEsp, true, v => Features.PlayerEsp = v);
+            L.T("隔墙显示其他玩家的框与距离(右键行改框色)", "隔牆顯示其他玩家的框與距離(右鍵行改框色)", "Boxes and distance through walls (right-click the row for colors)"),
+            Features.PlayerEsp, true, v => FeatureActions.Apply("PlayerEsp", v),
+            new[] { "PlayerEsp" });
+        ToggleRow(L.T("玩家骨骼", "玩家骨骼", "Skeleton"),
+            L.T("隔墙显示其他玩家的骨架线条(右键行改骨色)", "隔牆顯示其他玩家的骨架線條(右鍵行改骨色)", "Bone lines through walls (right-click the row for colors)"),
+            Features.PlayerSkeleton, true, v => FeatureActions.Apply("PlayerSkeleton", v),
+            new[] { "PlayerSkeleton" });
+        ToggleRow(L.T("玩家血量", "玩家血量", "Health bars"),
+            L.T("框顶显示其他玩家当前血量", "框頂顯示其他玩家當前血量", "Current HP above the box"),
+            Features.PlayerHealth, true, v => FeatureActions.Apply("PlayerHealth", v),
+            new[] { "PlayerHealth" });
+        ToggleRow(L.T("屏幕准星", "螢幕準星", "Crosshair"),
+            L.T("不开镜时显示枪口指向的准星", "不開鏡時顯示槍口指向的準星", "Muzzle-direction crosshair when not aiming down sights"),
+            Features.Crosshair, true, v => FeatureActions.Apply("Crosshair", v),
+            new[] { "Crosshair" });
         EndSection();
     }
 
@@ -666,26 +1155,24 @@ public static class MenuUi
         SliderRow(L.T("船速倍率", "船速倍率", "Boat Speed"), ref Features.BoatMult, 1f, 8f, "x");
         ToggleRow(L.T("载具飞行", "載具飛行", "Vehicle Flight"),
             L.T("W前 S后 A左 D右 / Space升 Ctrl降,船头随视线", "W前 S後 A左 D右 / Space升 Ctrl降,船頭隨視線", "W fwd, S back, A left, D right / Space up, Ctrl down; bow follows your view"),
-            Features.BoatFlight, true, v => Features.BoatFlight = v);
+            Features.BoatFlight, true, v => FeatureActions.Apply("BoatFlight", v),
+            new[] { "BoatFlight", Hotkeys.BoatFlightUp, Hotkeys.BoatFlightDown });
         EndSection();
 
         BeginSection(L.T("导航", "導航", "Navigation"));
         ToggleRow(L.T("岛屿标签", "島嶼標籤", "Island Labels"),
             L.T("屏幕直接显示所有岛屿方向与距离", "螢幕直接顯示所有島嶼方向與距離", "All islands: direction and distance on screen"),
-            Features.IslandLabels, true, v => Features.IslandLabels = v);
-        GUILayout.Label(
-            L.T("在视野内显示标签,在屏幕外显示边缘方向点,无需看雷达。",
+            Features.IslandLabels, true, v => FeatureActions.Apply("IslandLabels", v),
+            new[] { "IslandLabels" });
+        Hint(L.T("在视野内显示标签,在屏幕外显示边缘方向点,无需看雷达。",
                 "在視野內顯示標籤,在螢幕外顯示邊緣方向點,無需看雷達。",
-                "Labels for islands in view, edge direction dots for the rest — no radar needed."),
-            _labelDim);
+                "Labels for islands in view, edge direction dots for the rest — no radar needed."));
         EndSection();
 
         BeginSection(null);
-        GUILayout.Label(
-            L.T("发动油门时按倍率推进,关闭滑条或调回 1x 自动还原。",
+        Hint(L.T("发动油门时按倍率推进,关闭滑条或调回 1x 自动还原。",
                 "發動油門時按倍率推進,關閉滑條或調回 1x 自動還原。",
-                "Throttle scales by the multiplier; sliding back to 1x restores the original values."),
-            _labelDim);
+                "Throttle scales by the multiplier; sliding back to 1x restores the original values."));
         EndSection();
     }
 
@@ -713,11 +1200,9 @@ public static class MenuUi
             Features.RouletteAutoWin = v;
             Features.HostAct(CheatAction.RouletteAutoWin, flag: v);
         });
-        GUILayout.Label(
-            L.T("赌局旋转时顶部自动显示落点预测与稳定倒计时(球停稳 2 秒判胜)。",
+        Hint(L.T("赌局旋转时顶部自动显示落点预测与稳定倒计时(球停稳 2 秒判胜)。",
                 "賭局旋轉時頂部自動顯示落點預測與穩定倒數(球停穩 2 秒判勝)。",
-                "During spins the overlay shows the landing prediction and settle countdown (2s dwell wins)."),
-            _labelDim);
+                "During spins the overlay shows the landing prediction and settle countdown (2s dwell wins)."));
         EndSection();
 
         BeginSection(L.T("世界", "世界", "World"));
@@ -749,31 +1234,147 @@ public static class MenuUi
         EndSection();
     }
 
+    // ────────────────────────── tab: hotkeys ──────────────────────────
+
+    private static string ActionLabel(string action)
+    {
+        switch (action)
+        {
+            case Hotkeys.MenuToggle: return L.T("开关菜单", "開關選單", "Menu toggle");
+            case Hotkeys.AimbotTrigger: return L.T("自瞄触发", "自瞄觸發", "Aimbot trigger");
+            case Hotkeys.PlayerFlightUp: return L.T("玩家飞行 · 上升", "玩家飛行 · 上升", "Player flight · up");
+            case Hotkeys.PlayerFlightDown: return L.T("玩家飞行 · 下降", "玩家飛行 · 下降", "Player flight · down");
+            case Hotkeys.BoatFlightUp: return L.T("载具飞行 · 上升", "載具飛行 · 上升", "Boat flight · up");
+            case Hotkeys.BoatFlightDown: return L.T("载具飞行 · 下降", "載具飛行 · 下降", "Boat flight · down");
+            case "GodMode": return L.T("上帝模式", "上帝模式", "God Mode");
+            case "FullnessLock": return L.T("锁满饱食度", "鎖滿飽食度", "Fullness Lock");
+            case "KeepInventory": return L.T("保留物品栏", "保留物品欄", "Keep Inventory");
+            case "PlayerFlight": return L.T("玩家飞行", "玩家飛行", "Player Flight");
+            case "ThirdPerson": return L.T("第三人称", "第三人稱", "Third Person");
+            case "SelfOneShot": return L.T("秒杀", "秒殺", "One Shot");
+            case "BuiltInCheats": return L.T("游戏内置作弊", "遊戲內置作弊", "Built-in Cheats");
+            case "NoRecoil": return L.T("无后座", "無後座", "No Recoil");
+            case "NoSpread": return L.T("无扩散", "無擴散", "No Spread");
+            case "InfiniteAmmo": return L.T("无限子弹", "無限子彈", "Infinite Ammo");
+            case "Aimbot": return L.T("自瞄玩家", "自瞄玩家", "Aim Players");
+            case "PlayerEsp": return L.T("玩家透视", "玩家透視", "Player ESP");
+            case "PlayerSkeleton": return L.T("玩家骨骼", "玩家骨骼", "Skeleton");
+            case "PlayerHealth": return L.T("玩家血量", "玩家血量", "Health bars");
+            case "Crosshair": return L.T("屏幕准星", "螢幕準星", "Crosshair");
+            case "BoatFlight": return L.T("载具飞行", "載具飛行", "Vehicle Flight");
+            case "IslandLabels": return L.T("岛屿标签", "島嶼標籤", "Island Labels");
+            case "DripSpawn": return L.T("闪亮鱼", "閃亮魚", "Drip Fish");
+            default: return action;
+        }
+    }
+
+    private static string KeyName(KeyCode k)
+    {
+        if (k == KeyCode.None) return L.T("未设置", "未設置", "None");
+        if (k == KeyCode.Mouse0) return L.T("鼠标左键", "鼠標左鍵", "Mouse L");
+        if (k == KeyCode.Mouse1) return L.T("鼠标右键", "鼠標右鍵", "Mouse R");
+        if (k == KeyCode.Mouse2) return L.T("鼠标中键", "鼠標中鍵", "Mouse M");
+        return k.ToString();
+    }
+
+    private static void TabKeys(CheatController c)
+    {
+        BeginSection(L.T("功能键", "功能鍵", "Actions"));
+        foreach (var action in Hotkeys.All)
+            BindRow(action);
+        EndSection();
+
+        BeginSection(L.T("开关热键", "開關熱鍵", "Toggle hotkeys"));
+        foreach (var id in Hotkeys.ToggleIds)
+            BindRow(id);
+        EndSection();
+
+        BeginSection(null);
+        Hint(L.T("在功能行上直接右键也能弹出绑定窗口。点击按钮后按下新按键(鼠标键也可以),Esc 取消。",
+                "在功能行上直接右鍵也能彈出綁定視窗。點擊按鈕後按下新按鍵(鼠標鍵也可以),Esc 取消。",
+                "You can also right-click a feature row to open the bind popup. Click a button, then press the new key (mouse works too). Esc cancels."));
+        EndSection();
+    }
+
+    private static void BindRow(string action)
+    {
+        if (_fold)
+            return;
+        var r = GUILayoutUtility.GetRect(0, 30, GUILayout.ExpandWidth(true));
+        GUI.Label(new Rect(r.x, r.y + 5, r.width - 140, 20), ActionLabel(action), _label);
+
+        bool listening = _listening == action;
+        string btnText = listening
+            ? L.T("按任意键…", "按任意鍵…", "Press any key…")
+            : KeyName(Hotkeys.Key(action));
+        var br = new Rect(r.xMax - 132, r.y + 3, 126, 24);
+        if (GUI.Button(br, btnText, listening ? _btnAccent : _btn) && !listening && _listening == null)
+            _listening = action;
+    }
+
     // ────────────────────────── widgets ──────────────────────────
 
     private static float _y;
+
+    // collapsible sections: click a header to fold/unfold its content
+    private static readonly Dictionary<string, bool> _folded = new();
+    private static bool _fold;
 
     private static void BeginSection(string title)
     {
         GUILayout.Space(4);
         _y = 0;
-        if (title != null)
+        if (title == null)
         {
-            GUILayout.Label(title.ToUpperInvariant(), _labelDim);
-            GUILayout.Space(2);
+            _fold = false;
+            return;
         }
+
+        bool folded = _folded.TryGetValue(title, out var f) && f;
+        _fold = folded;
+
+        var r = GUILayoutUtility.GetRect(0, 20, GUILayout.ExpandWidth(true));
+        GUI.Label(new Rect(r.x, r.y + 2, r.width - 20, 18),
+            (folded ? "▸  " : "▾  ") + title.ToUpperInvariant(), _labelDim);
+        if (Event.current.type == EventType.MouseDown && r.Contains(Event.current.mousePosition))
+        {
+            _folded[title] = !folded;
+            Event.current.Use();
+        }
+        if (!folded)
+            GUILayout.Space(2);
     }
 
     private static void EndSection()
     {
+        _fold = false;
         GUILayout.Space(8);
     }
 
-    private static void ToggleRow(string label, string sub, bool value, bool enabled, Action<bool> onChange)
+    /// <summary>Muted helper text inside a section; hidden while the section is folded.</summary>
+    private static void Hint(string text)
     {
+        if (_fold)
+            return;
+        GUILayout.Label(text, _labelDim);
+    }
+
+    private static void ToggleRow(string label, string sub, bool value, bool enabled, Action<bool> onChange,
+        string[] bindActions = null)
+    {
+        if (_fold)
+            return;
         var r = GUILayoutUtility.GetRect(0, 36, GUILayout.ExpandWidth(true));
         GUI.Label(new Rect(r.x, r.y + 2, r.width - 60, 18), label, _label);
         GUI.Label(new Rect(r.x, r.y + 19, r.width - 60, 16), sub, _labelDim);
+
+        // right-click on a bindable row → neverlose-style keybind popup
+        if (bindActions != null && Event.current.type == EventType.MouseDown
+            && Event.current.button == 1 && r.Contains(Event.current.mousePosition))
+        {
+            OpenBindPopup(bindActions, Event.current.mousePosition);
+            Event.current.Use();
+        }
 
         var pill = new Rect(r.xMax - 48, r.y + 7, 44, 22);
         if (GUI.Button(pill, "", value ? _pillOn : _pillOff) && enabled)
@@ -788,10 +1389,21 @@ public static class MenuUi
         }
     }
 
-    private static void ToggleRowInline(string label, bool value, Action<bool> onChange)
+    private static void ToggleRowInline(string label, bool value, Action<bool> onChange, string[] bindActions = null)
     {
+        if (_fold)
+            return;
         var r = GUILayoutUtility.GetRect(0, 26, GUILayout.ExpandWidth(true));
         GUI.Label(new Rect(r.x, r.y + 3, r.width - 60, 20), label, _label);
+
+        // right-click on a bindable row → keybind popup
+        if (bindActions != null && Event.current.type == EventType.MouseDown
+            && Event.current.button == 1 && r.Contains(Event.current.mousePosition))
+        {
+            OpenBindPopup(bindActions, Event.current.mousePosition);
+            Event.current.Use();
+        }
+
         var pill = new Rect(r.xMax - 48, r.y + 2, 44, 22);
         if (GUI.Button(pill, "", value ? _pillOn : _pillOff))
             onChange(!value);
@@ -816,17 +1428,43 @@ public static class MenuUi
 
     private static void SliderRow(string label, ref float value, float min, float max, string suffix)
     {
+        if (_fold)
+            return;
         var r = GUILayoutUtility.GetRect(0, 34, GUILayout.ExpandWidth(true));
         GUI.Label(new Rect(r.x, r.y, r.width - 70, 18), label, _label);
         GUI.Label(new Rect(r.xMax - 66, r.y, 66, 18),
             $"{value:0.0}{suffix}", _value);
         var bar = new Rect(r.x, r.y + 20, r.width, 14);
         float nv = GUI.HorizontalSlider(bar, value, min, max, _sliderBg, _sliderThumb);
-        value = Mathf.Round(nv * 10f) / 10f; // snap to 0.1
+        float snapped = Mathf.Round(nv * 10f) / 10f; // snap to 0.1
+        if (!Mathf.Approximately(snapped, value))
+            Settings.MarkDirty();
+        value = snapped;
+    }
+
+    /// <summary>Segmented option picker (e.g. fire mode: click / hold / hold+click).</summary>
+    private static void OptionRow(string label, string[] options, ref int index)
+    {
+        if (_fold)
+            return;
+        var r = GUILayoutUtility.GetRect(0, 30, GUILayout.ExpandWidth(true));
+        GUI.Label(new Rect(r.x, r.y + 5, r.width - 205, 20), label, _label);
+        float bw = 62;
+        for (int i = 0; i < options.Length; i++)
+        {
+            var br = new Rect(r.xMax - 200 + i * (bw + 3), r.y + 3, bw, 24);
+            if (GUI.Button(br, options[i], index == i ? _btnAccent : _btn) && index != i)
+            {
+                index = i;
+                Settings.MarkDirty();
+            }
+        }
     }
 
     private static void ButtonRow(string left, string right, bool enabled, Action onLeft, Action onRight)
     {
+        if (_fold)
+            return;
         var r = GUILayoutUtility.GetRect(0, 32, GUILayout.ExpandWidth(true));
         float gap = 8;
         float w = right != null ? (r.width - gap) / 2f : r.width;
@@ -911,6 +1549,7 @@ public static class MenuUi
         _title = Style(null, CAccent, 14, bold: true);
         _label = Style(null, CText, 13, rich: true);
         _labelDim = Style(null, CTextDim, 11, rich: true);
+        _labelDim.wordWrap = true; // long hint lines must wrap, not widen the tab (no h-scrollbar)
         _labelSmall = Style(null, CText, 12);
         _value = Style(null, CAccent, 13, align: TextAnchor.UpperRight, rich: true);
         _hint = Style(null, new Color(0.75f, 0.79f, 0.82f, 0.85f), 11);

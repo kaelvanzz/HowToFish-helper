@@ -102,6 +102,8 @@ public static class Loader
 
     public static void Log(string msg)
     {
+        try { LogSink?.Invoke(msg); }
+        catch { /* ignore logging failures */ }
         try
         {
             File.AppendAllText(
@@ -110,4 +112,7 @@ public static class Loader
         }
         catch { /* ignore logging failures */ }
     }
+
+    /// <summary>Set by HtfPlugin under BepInEx: mirrors mod logs into LogOutput.log.</summary>
+    public static Action<string> LogSink;
 }

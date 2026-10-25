@@ -2,6 +2,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.Mono;
 using HarmonyLib;
+using System.Reflection;
 
 namespace HTFMod;
 
@@ -22,6 +23,9 @@ public class HtfPlugin : BaseUnityPlugin
                 Config.Save();
             };
             L.ApplyKey(_lang.Value);
+            Hotkeys.Init(Config);
+            Settings.Init(Config);
+            Loader.LogSink = m => Logger.LogInfo(m);
 
             var harmony = new Harmony("htf.cheatmenu");
             int ok = 0, fail = 0;
@@ -43,12 +47,14 @@ public class HtfPlugin : BaseUnityPlugin
 
             // One-shot: Item.LocalHit is virtual and overridden by Creature/BowheadWhale/DeadPlayer.
             // Virtual dispatch would bypass a base-class-only patch, so patch every override too.
+            // (Silent lookup: subclasses without their own override produce no warnings.)
             var oneShotPrefix = new HarmonyMethod(typeof(Patch_Item_LocalHit), nameof(Patch_Item_LocalHit.Prefix));
             foreach (var t in typeof(Item).Assembly.GetTypes())
             {
                 if (!typeof(Item).IsAssignableFrom(t) || t.IsAbstract)
                     continue;
-                var m = AccessTools.DeclaredMethod(t, "LocalHit");
+                var m = t.GetMethod("LocalHit",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
                 if (m == null)
                     continue;
                 try

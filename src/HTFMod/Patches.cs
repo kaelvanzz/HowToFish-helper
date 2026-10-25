@@ -75,13 +75,66 @@ internal static class Patch_PlayerMovement_Move
                 return;
 
             Vector3 v = rb.linearVelocity;
-            if (InputX.KeyHeld(KeyCode.Space))
+            if (InputX.KeyHeld(Hotkeys.Key(Hotkeys.PlayerFlightUp)))
                 v.y = 10f;
-            else if (InputX.KeyHeld(KeyCode.LeftControl))
+            else if (InputX.KeyHeld(Hotkeys.Key(Hotkeys.PlayerFlightDown)))
                 v.y = -10f;
             else
                 v.y = 0f;
             rb.linearVelocity = v;
+        }
+        catch { }
+    }
+}
+
+/// <summary>
+/// Skip reload entirely for the local player while Infinite Ammo is on: the game's
+/// LocalReload (R key or auto-reload on empty mag) is skipped and the queued-reload
+/// flag cleared — the magazine is always full, so firing continues without interruption.
+/// </summary>
+[HarmonyPatch(typeof(Weapon), "LocalReload")]
+internal static class Patch_Weapon_LocalReload
+{
+    private static readonly FieldInfo FiQueue = AccessTools.Field(typeof(Weapon), "_queueReload");
+
+    private static bool Prefix(Weapon __instance)
+    {
+        if (!Features.InfiniteAmmo)
+            return true;
+        try
+        {
+            var holder = __instance.Holder;
+            if (holder == null || holder != Player.LocalPlayer)
+                return true;
+            FiQueue?.SetValue(__instance, false);
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+}
+
+/// <summary>
+/// Fire mode "hold+click": every click fires instantly even while the previous
+/// cooldown is still running (hold already sprays via forced full-auto).
+/// </summary>
+[HarmonyPatch(typeof(Weapon), "PrimaryInput")]
+internal static class Patch_Weapon_PrimaryInput
+{
+    private static readonly FieldInfo FiCool = AccessTools.Field(typeof(Weapon), "_hasCoolDown");
+
+    private static void Prefix(Weapon __instance)
+    {
+        if (Features.FireMode != 2)
+            return;
+        try
+        {
+            var holder = __instance.Holder;
+            if (holder == null || holder != Player.LocalPlayer)
+                return;
+            FiCool?.SetValue(__instance, false); // the click always shoots right now
         }
         catch { }
     }
@@ -107,12 +160,21 @@ internal static class Patch_PlayerCamera_SetFov
 }
 
 /// <summary>
-/// Third person: the game places the camera at the player's head every frame;
-/// afterwards we pull it back along the view direction by the configured distance.
+/// PlayerCamera.SetCamPosRot is where the game copies _rot onto the camera transform.
+/// - Prefix (aimbot): the pull is already in _rot when the camera applies it —
+///   immune to script execution order and visible the same frame.
+/// - Postfix (third person): the game places the camera at the player's head;
+///   afterwards we pull it back along the view direction by the configured distance.
 /// </summary>
 [HarmonyPatch(typeof(PlayerCamera), "SetCamPosRot")]
 internal static class Patch_PlayerCamera_SetCamPosRot
 {
+    private static void Prefix(PlayerCamera __instance)
+    {
+        if (Combat.AimActive)
+            Combat.ApplyAim(__instance);
+    }
+
     private static void Postfix(PlayerCamera __instance)
     {
         if (!Features.ThirdPerson || Features.ThirdPersonDist <= 0.05f)

@@ -23,12 +23,20 @@ public static class Features
     public static bool NoRecoil;
     public static bool NoSpread;
     public static bool InfiniteAmmo;
+    public static bool FastFire;           // apply FireRateMult to every weapon
+    public static float FireRateMult = 1f; // every weapon's shot interval divider
+    public static int FireMode = 1;        // 0 = semi (click) / 1 = auto (hold) / 2 = auto + instant click
     public static bool KeepInventory;    // no drops on death/respawn
     public static bool SelfOneShot;      // own attacks deal fixed 100000 damage
     public static bool Aimbot;           // aim players while holding RMB
+    public static bool Crosshair;        // screen-center crosshair when not aiming down sights
     public static float AimbotStrength = 0.5f;
     public static float AimbotMaxAngle = 30f;
     public static bool PlayerEsp;
+    public static bool PlayerSkeleton;      // draw bone lines for other players
+    public static bool PlayerHealth;        // health bar above the box
+    public static int EspBoxColor = 0xF24C4C;      // packed 0xRRGGBB
+    public static int EspSkeletonColor = 0x4CE65E; // packed 0xRRGGBB
     public static bool BoatFlight;       // W/A/S/D + Space/Ctrl, bow follows view
     public static bool PlayerFlight;     // Space/Ctrl flight; yields while driving
     public static bool ThirdPerson;      // camera behind the player
@@ -96,7 +104,9 @@ public static class Features
 
     public static void TickVitals()
     {
-        if (!IsHost)
+        // The game pre-hosts a local FishNet server on the main menu (IsHost is true
+        // there), so InGame must be checked first or Local.Vitals throws on null player.
+        if (!InGame || !IsHost)
             return;
         if (FullnessLock)
             WriteVitals(Local.Vitals);
@@ -395,8 +405,8 @@ public static class Features
         if (InputX.KeyHeld(KeyCode.S)) move -= fwd;
         if (InputX.KeyHeld(KeyCode.D)) move += rightV;
         if (InputX.KeyHeld(KeyCode.A)) move -= rightV;
-        if (InputX.KeyHeld(KeyCode.Space)) move += Vector3.up;
-        if (InputX.KeyHeld(KeyCode.LeftControl)) move -= Vector3.up;
+        if (InputX.KeyHeld(Hotkeys.Key(Hotkeys.BoatFlightUp))) move += Vector3.up;
+        if (InputX.KeyHeld(Hotkeys.Key(Hotkeys.BoatFlightDown))) move -= Vector3.up;
         if (move.sqrMagnitude > 0.0001f)
         {
             // MovePosition/MoveRotation go through physics interpolation: items on the
@@ -840,7 +850,14 @@ public static class ItemDb
         {
             var items = Resources.LoadAll<Item>("Items");
             All = items.Where(i => i != null).OrderBy(NameOf, StringComparer.OrdinalIgnoreCase).ToList();
-            Creatures = All.Where(i => i.Creature != null || i is Creature).ToList();
+
+            // Creatures: prefer the game's own spawnable registry (the same set its
+            // spawn commands use). The raw Resources scan also catches decorative
+            // creatures that have no health bar and take no damage from any hit.
+            Creatures = SpawnableCreatures();
+            if (Creatures.Count == 0)
+                Creatures = All.Where(i => i.Creature != null || i is Creature).ToList();
+
             Loaded = true;
             Loader.Log($"Item DB cached: {All.Count} items, {Creatures.Count} creatures");
         }
@@ -848,6 +865,30 @@ public static class ItemDb
         {
             Loader.Log("ItemDb.Load failed: " + e);
         }
+    }
+
+    /// <summary>Creature items from GameInfo's spawnable registry (reflected static dict).</summary>
+    private static List<Item> SpawnableCreatures()
+    {
+        try
+        {
+            var f = AccessTools.Field(typeof(GameInfo), "_idToSpawnable");
+            if (f?.GetValue(null) is System.Collections.IDictionary dict)
+            {
+                var list = new List<Item>();
+                var seen = new HashSet<Item>();
+                foreach (var v in dict.Values)
+                {
+                    if (v is Item it && (it.Creature != null || it is Creature) && seen.Add(it))
+                        list.Add(it);
+                }
+                return list.OrderBy(NameOf, StringComparer.OrdinalIgnoreCase).ToList();
+            }
+        }
+        catch
+        {
+        }
+        return new List<Item>();
     }
 
     public static string NameOf(Item i)
