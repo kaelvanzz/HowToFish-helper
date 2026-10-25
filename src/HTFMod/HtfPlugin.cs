@@ -1,4 +1,5 @@
 using BepInEx;
+using BepInEx.Configuration;
 using BepInEx.Unity.Mono;
 using HarmonyLib;
 
@@ -7,10 +8,21 @@ namespace HTFMod;
 [BepInPlugin("htf.cheatmenu", "How to Fish 鱼塘改造器", "1.1.0")]
 public class HtfPlugin : BaseUnityPlugin
 {
+    private ConfigEntry<string> _lang;
+
     private void Awake()
     {
         try
         {
+            _lang = Config.Bind("General", "Language", "auto",
+                "Menu language: auto / zh-hans / zh-hant / en");
+            L.SaveHook = key =>
+            {
+                _lang.Value = key;
+                Config.Save();
+            };
+            L.ApplyKey(_lang.Value);
+
             var harmony = new Harmony("htf.cheatmenu");
             int ok = 0, fail = 0;
             foreach (var t in typeof(HtfPlugin).Assembly.GetTypes())
@@ -25,12 +37,12 @@ public class HtfPlugin : BaseUnityPlugin
                 catch (System.Exception e)
                 {
                     fail++;
-                    Logger.LogWarning("补丁失败(已跳过,不影响其他功能): " + t.Name + " — " + e.Message);
+                    Logger.LogWarning("Patch failed (skipped, other features unaffected): " + t.Name + " — " + e.Message);
                 }
             }
 
-            // 秒杀:Item.LocalHit 是虚方法且被 Creature/BowheadWhale/DeadPlayer 等重写,
-            // 必须把所有子类重写也打上,否则打生物时虚分发绕过基类补丁
+            // One-shot: Item.LocalHit is virtual and overridden by Creature/BowheadWhale/DeadPlayer.
+            // Virtual dispatch would bypass a base-class-only patch, so patch every override too.
             var oneShotPrefix = new HarmonyMethod(typeof(Patch_Item_LocalHit), nameof(Patch_Item_LocalHit.Prefix));
             foreach (var t in typeof(Item).Assembly.GetTypes())
             {
@@ -47,16 +59,16 @@ public class HtfPlugin : BaseUnityPlugin
                 catch (System.Exception e)
                 {
                     fail++;
-                    Logger.LogWarning("秒杀补丁失败(已跳过): " + t.Name + " — " + e.Message);
+                    Logger.LogWarning("One-shot patch failed (skipped): " + t.Name + " — " + e.Message);
                 }
             }
 
             ModCore.Initialize();
-            Logger.LogInfo($"HTFMod v1.1 已加载 — 补丁 {ok} 成功 / {fail} 失败,按 Insert 打开菜单");
+            Logger.LogInfo($"HTFMod v1.1 loaded — patches {ok} ok / {fail} failed, press INSERT for menu");
         }
         catch (System.Exception e)
         {
-            Logger.LogError("HTFMod 初始化失败: " + e);
+            Logger.LogError("HTFMod init failed: " + e);
         }
     }
 }

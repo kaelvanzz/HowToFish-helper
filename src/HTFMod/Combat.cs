@@ -5,11 +5,13 @@ using UnityEngine;
 namespace HTFMod;
 
 /// <summary>
-/// 战斗辅助:
-/// - 无后座:Harmony 拦截视角/枪模后座与跳跃甩动(Patches.cs)。
-/// - 无扩散:每帧清零手持武器散布角。
-/// - 弹道=准星:子弹与激光收敛到相机准星落点,修复移动/跳跃/枪模晃动偏移。
-/// - 自瞄玩家:按住右键瞄准且手持枪械时,锁定离准星最近的玩家持续跟踪。
+/// Combat helpers:
+/// - No recoil: Harmony blocks view/gun-model recoil (see Patches.cs).
+/// - No spread: zeroes the held weapon's spread angle every frame.
+/// - Infinite ammo: keeps the held weapon's magazine full.
+/// - Aim players: while holding RMB with a gun equipped, locks onto the player
+///   closest to the crosshair and tracks until it dies or leaves the cone.
+/// - Player ESP: boxes + distance for other players through walls (drawn in MenuUi).
 /// </summary>
 public static class Combat
 {
@@ -70,7 +72,7 @@ public static class Combat
         }
     }
 
-    // ────────────────────────── 无扩散 / 无限子弹 ──────────────────────────
+    // ────────────────────── No spread / infinite ammo ──────────────────────
 
     private static void TickWeapon(Player p)
     {
@@ -92,18 +94,18 @@ public static class Combat
                 {
                     int cur = (int)_piAmmo.GetValue(w);
                     if (cur != max)
-                        _piAmmo.SetValue(w, max); // 弹匣永远满
+                        _piAmmo.SetValue(w, max); // magazine always full
                 }
             }
         }
-        catch { /* 切枪/换弹瞬间对象为空,忽略 */ }
+        catch { /* object vanishing between equip/unequip frames, ignore */ }
     }
 
-    // ────────────────────────── 自瞄玩家 ──────────────────────────
+    // ────────────────────── Aim players ──────────────────────
 
     private static void TickAimbot(Player p, bool menuOpen)
     {
-        // 激活条件:按住右键瞄准 + 手持枪械 + 鼠标锁定(非菜单/背包/暂停)
+        // Activation: RMB held + holding a gun + mouse locked (not in menu/inventory/pause)
         if (menuOpen || !InputX.MouseRightHeld() || !HoldingGun(p))
         {
             _lockedPlayer = null;
@@ -123,7 +125,7 @@ public static class Combat
         Vector3 forward = cam.transform.forward;
         float maxAngle = Features.AimbotMaxAngle;
 
-        // 锁定粘性:目标没死、没出锥、没出距就继续跟
+        // Sticky lock: keep tracking until the target dies or leaves the cone
         if (_lockedPlayer != null && _lockedPlayer != Player.LocalPlayer && !IsDead(_lockedPlayer))
         {
             if (GetPlayerBounds(_lockedPlayer, out var b) && LockValid(b.center, camPos, forward, maxAngle))
@@ -134,7 +136,7 @@ public static class Combat
         }
         _lockedPlayer = null;
 
-        // 重新选:视野锥内离准星角度最近的存活玩家
+        // Re-acquire: closest-to-crosshair alive player inside the cone
         Player best = null;
         float bestAngle = maxAngle;
         Vector3 bestAim = Vector3.zero;
@@ -170,8 +172,8 @@ public static class Combat
     }
 
     /// <summary>
-    /// 玩家模型的渲染包围盒(聚合所有近处部件)。
-    /// transform 位置不可靠,用可见身体的真实包围盒才能瞄正、框正。
+    /// Player model render bounds (aggregates nearby parts). The transform origin is
+    /// unreliable — using the visible body guarantees correct aiming and ESP boxes.
     /// </summary>
     public static bool GetPlayerBounds(Player pl, out Bounds b)
     {
@@ -190,7 +192,7 @@ public static class Combat
                 if (r == null)
                     continue;
                 var rb = r.bounds;
-                if ((rb.center - pos).sqrMagnitude > 16f) // 4m 外的部件(名牌等)不算
+                if ((rb.center - pos).sqrMagnitude > 16f) // skip parts >4m away (name tags etc.)
                     continue;
                 if (!has) { acc = rb; has = true; }
                 else acc.Encapsulate(rb);
@@ -228,7 +230,7 @@ public static class Combat
         float dist = to.magnitude;
         if (dist < 1.5f || dist > 170f)
             return false;
-        return Vector3.Angle(forward, to) <= maxAngle + 8f; // 滞回,边界抖动不丢锁
+        return Vector3.Angle(forward, to) <= maxAngle + 8f; // hysteresis: no lock flapping at the boundary
     }
 
     private static void AimAt(PlayerCamera pc, Vector3 camPos, Vector3 aimPos)
@@ -245,8 +247,9 @@ public static class Combat
     }
 
     /// <summary>
-    /// 相机准星的世界落点:从相机中心沿视线打射线,命中即返回命中点,否则取 300m 远处。
-    /// "弹道=准星"的子弹与激光都收敛到这个点,保证三者重合。
+    /// World impact point of the camera crosshair: raycast from the camera center along
+    /// the view direction; falls back to a point 300m away. Bullets and the laser
+    /// (when convergence is enabled) resolve to this point.
     /// </summary>
     public static Vector3 CameraAimPoint(Vector3 fromPos)
     {
@@ -256,7 +259,7 @@ public static class Combat
         Vector3 o = cam.transform.position;
         Vector3 d = cam.transform.forward;
         if (Physics.Raycast(o, d, out var hit, 300f, GameInfo.ProjectileHitLayer, QueryTriggerInteraction.Ignore)
-            && (hit.point - o).sqrMagnitude > 2.25f) // 贴脸误判保护
+            && (hit.point - o).sqrMagnitude > 2.25f) // guard against point-blank self hits
             return hit.point;
         return o + d * 300f;
     }

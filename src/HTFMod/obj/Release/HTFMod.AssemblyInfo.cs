@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("HTFMod")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f2a6638bf55dca9f95b22236aa0712f96e36ea1a")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+8a16aebe1367ae2d64894751897af5c71c06443d")]
 [assembly: System.Reflection.AssemblyProductAttribute("HTFMod")]
 [assembly: System.Reflection.AssemblyTitleAttribute("HTFMod")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

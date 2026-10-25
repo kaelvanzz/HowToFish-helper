@@ -4,7 +4,10 @@ using UnityEngine.InputSystem;
 
 namespace HTFMod;
 
-/// <summary>兼容旧 Input Manager 与新 Input System 两种后端。</summary>
+/// <summary>
+/// Input helpers that work under both the legacy Input Manager and the new Input System.
+/// The backend is probed once on first use and cached.
+/// </summary>
 public static class InputX
 {
     private static int _mode = -1; // 0 = legacy, 1 = input system
@@ -33,7 +36,7 @@ public static class InputX
         return SysHold(code);
     }
 
-    /// <summary>按住鼠标左键(两种输入后端通吃)。</summary>
+    /// <summary>Left mouse held (works with both input backends).</summary>
     public static bool MouseLeftHeld()
     {
         EnsureMode();
@@ -46,7 +49,7 @@ public static class InputX
         return m != null && m.leftButton.isPressed;
     }
 
-    /// <summary>按住鼠标右键(瞄准)。自瞄激活用。</summary>
+    /// <summary>Right mouse held (aiming). Aimbot trigger.</summary>
     public static bool MouseRightHeld()
     {
         EnsureMode();
@@ -57,6 +60,18 @@ public static class InputX
         }
         var m = UnityEngine.InputSystem.Mouse.current;
         return m != null && m.rightButton.isPressed;
+    }
+
+    /// <summary>Arbitrary key held (used by flight features).</summary>
+    public static bool KeyHeld(KeyCode code)
+    {
+        EnsureMode();
+        if (_mode == 0)
+        {
+            try { return Input.GetKey(code); }
+            catch { _mode = 1; }
+        }
+        return SysHold(code);
     }
 
     private static void EnsureMode()
@@ -82,24 +97,13 @@ public static class InputX
                 KeyCode.F2 => kb.f2Key.wasPressedThisFrame,
                 KeyCode.F3 => kb.f3Key.wasPressedThisFrame,
                 KeyCode.Space => kb.spaceKey.wasPressedThisFrame,
+                KeyCode.LeftControl => kb.leftCtrlKey.wasPressedThisFrame,
                 KeyCode.M => kb.mKey.wasPressedThisFrame,
                 KeyCode.N => kb.nKey.wasPressedThisFrame,
                 _ => false,
             };
         }
         catch { return false; }
-    }
-
-    /// <summary>按住任意键(自瞄/载具飞行用;新输入系统只映射常用键)。</summary>
-    public static bool KeyHeld(KeyCode code)
-    {
-        EnsureMode();
-        if (_mode == 0)
-        {
-            try { return Input.GetKey(code); }
-            catch { _mode = 1; }
-        }
-        return SysHold(code);
     }
 
     private static bool SysHold(KeyCode code)

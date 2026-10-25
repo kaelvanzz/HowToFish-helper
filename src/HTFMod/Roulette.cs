@@ -5,10 +5,19 @@ using UnityEngine;
 namespace HTFMod;
 
 /// <summary>
-/// 轮盘赌落点预测。结果由服务器物理模拟决定(球 + 转盘),
-/// 双方都能实时读取球相对转盘的槽位 —— 游戏在球稳定同一格 2 秒后判胜,
-/// 因此叠加层显示"当前槽位 + 稳定倒计时",球停稳后预测即收敛为必中。
-/// 主机读 _isPlaying 精确判定;客户端用球位移启发式。
+/// Roulette landing prediction + auto-win.
+/// Prediction: the result is decided by server-side physics (ball + spinning wheel);
+/// both host and clients can read the current slot from the ball/wheel state in real
+/// time. The game declares the winner after the ball rests in one slot for 2 seconds,
+/// so the overlay shows the current slot plus a settle countdown — the prediction
+/// converges to certainty seconds before the official result.
+/// Host reads _isPlaying for exact state; clients use a ball-movement heuristic.
+/// Auto-win (host only, Features.RouletteAutoWin): shortly after launch the ball is
+/// frozen and the wheel's own spin is stopped; then the WHEEL is rotated one slot per
+/// frame until the game's own color-judgment function reads the bet color
+/// (CasinoManager._curBetColor). The game's 2-second dwell check then declares the
+/// bet color the winner through the native payout flow. A 5s timeout falls back to
+/// calling the game's result API directly.
 /// </summary>
 public static class Roulette
 {
@@ -19,7 +28,7 @@ public static class Roulette
     private static FieldInfo _fiWheel;
     private static FieldInfo _fiWheelSpeed;
     private static FieldInfo _fiSlotSize;
-    private static FieldInfo _fiCurBet; // CasinoManager 静态:当前下注颜色
+    private static FieldInfo _fiCurBet; // CasinoManager static: current bet color
 
     private static LocalCasino _tracked;
     private static Rigidbody _ball;
@@ -30,7 +39,7 @@ public static class Roulette
     private static float _lastMoveTime;
     private static bool _active;
 
-    // 必中干预状态
+    // auto-win intervention state
     private static float _playSince;
     private static float _steerElapsed;
     private static bool _wasPlaying;
@@ -66,7 +75,7 @@ public static class Roulette
         }
     }
 
-    /// <summary>每帧调用(CheatController.Update)。</summary>
+    /// <summary>Called every frame from CheatController.Update.</summary>
     public static void Tick()
     {
         var c = LocalCasino.Instance;
@@ -95,7 +104,8 @@ public static class Roulette
                 _dwell = 0f;
             }
 
-            // 1) 当前槽位(游戏自己的判定逻辑,含 LookAt 副作用,与服务器一致)
+            // 1) Current slot via the game's own judgment code (includes the LookAt
+            //    side effect, so the readout matches the server exactly).
             BetColor col = (BetColor)_miColor.Invoke(c, null);
             if (col != _prevColor)
             {
@@ -107,7 +117,8 @@ public static class Roulette
                 _dwell += Time.deltaTime;
             }
 
-            // 2) 活动检测:主机直接读 _isPlaying;客户端看球是否在动
+            // 2) Activity detection: host reads _isPlaying directly; clients watch
+            //    whether the ball is moving.
             bool playing = false;
             try { playing = (bool)_fiPlaying.GetValue(c); } catch { }
 
@@ -125,7 +136,8 @@ public static class Roulette
 
             _active = playing || Time.time - _lastMoveTime < 2.5f;
 
-            // 3) 必中干预(主机):球出手 0.4s 后接管,把转盘盘面转到下注颜色下
+            // 3) Auto-win (host): 0.4s after launch, take over — rotate the WHEEL
+            //    until the game's own judgment reads the bet color.
             bool steerNow = playing && Features.RouletteAutoWin && Features.IsHost
                             && Time.time - _playSince > 0.4f;
             if (steerNow)
@@ -136,7 +148,7 @@ public static class Roulette
             {
                 if (_steerEngaged && playing && Features.IsHost && _ball != null)
                 {
-                    _ball.isKinematic = false; // 中途关闭必中:把球还给物理
+                    _ball.isKinematic = false; // auto-win turned off mid-round: give the ball back to physics
                     _steerEngaged = false;
                 }
                 _steerElapsed = 0f;
@@ -149,8 +161,10 @@ public static class Roulette
     }
 
     /// <summary>
-    /// 必中:冻结球,逐帧把轮盘旋转一格,直到游戏自己的判定函数读出下注颜色;
-    /// 之后游戏的 2 秒稳定判定自然判赢。5 秒内没转到位则直接调用游戏结果接口兜底。
+    /// Auto-win: freeze the ball, then rotate the wheel one slot per frame until the
+    /// game's own judgment function reads the bet color; the game's 2-second dwell
+    /// check then declares the win natively. If not aligned within 5 seconds, call
+    /// the game's result API directly as a fallback.
     /// </summary>
     private static void SteerToBetColor(LocalCasino c)
     {
@@ -165,7 +179,8 @@ public static class Roulette
             return;
         var target = (BetColor)betRaw;
 
-        // 冻结球 + 停掉转盘自动转速(游戏下一帧自行把 _isSpinning 置 false)
+        // Freeze the ball + stop the wheel's own spin speed
+        // (the game sets _isSpinning = false by itself next frame).
         ball.isKinematic = true;
         ball.linearVelocity = Vector3.zero;
         ball.angularVelocity = Vector3.zero;
@@ -175,22 +190,22 @@ public static class Roulette
         BetColor cur = (BetColor)_miColor.Invoke(c, null);
         if (cur == target)
         {
-            _steerElapsed = 0f; // 已到位:停手,等游戏 2 秒判定 → 必赢
+            _steerElapsed = 0f; // aligned: hands off — the game's 2s dwell check now wins the bet
             return;
         }
 
         _steerElapsed += Time.deltaTime;
         if (_steerElapsed > 5f)
         {
-            // 兜底:直接宣判下注颜色获胜(游戏公开接口,走完整结算)
+            // Fallback: declare the bet color the winner directly (public game API, full payout flow).
             _fiPlaying.SetValue(c, false);
             cm.ServerRouletteResult(target);
             _steerElapsed = 0f;
-            Loader.Log("轮盘必中:物理转向超时,已直接判定 " + target);
+            Loader.Log("Roulette auto-win: physics steering timed out, declared " + target + " directly");
             return;
         }
 
-        // 把轮盘转一格(每帧一格,最多 ~37 格转满一圈)
+        // Rotate the wheel by one slot per frame (max ~37 frames for a full revolution).
         float step = Convert.ToSingle(_fiSlotSize.GetValue(c));
         Vector3 e = wheel.localEulerAngles;
         wheel.localEulerAngles = new Vector3(e.x, e.y + step, e.z);

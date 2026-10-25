@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -7,15 +8,16 @@ using System.Threading;
 namespace HTFMod;
 
 /// <summary>
-/// 注入入口。在远程线程上执行,绝不触碰 Unity API ——
-/// 通过 UnityEngine.Awaitable 的私有静态同步上下文把初始化投递到 Unity 主线程。
+/// CLI-injector entry point. Runs on a remote thread and never touches Unity APIs —
+/// initialization is posted to the Unity main thread through the private sync context
+/// of UnityEngine.Awaitable. (Legacy path: the working injection is BepInEx/doorstop.)
 /// </summary>
 public static class Loader
 {
     public const string Namespace = "HTFMod";
     public const string ClassName = "Loader";
     public const string MethodName = "Load";
-    public const string Version = "1.0";
+    public const string Version = "1.1";
 
     public static volatile bool Ok;
     private static volatile string _error;
@@ -25,26 +27,26 @@ public static class Loader
         var watcher = new Thread(PollForMainThread) { IsBackground = true, Name = "HTFMod.Loader" };
         watcher.Start();
 
-        // 注入器会等这个方法返回;给它最多 20s 判定结果
+        // The injector waits for this method to return; allow up to 20s to settle.
         var sw = Stopwatch.StartNew();
         while (!Ok && _error == null && sw.ElapsedMilliseconds < 20000)
             Thread.Sleep(100);
 
         if (_error != null)
-            throw new InvalidOperationException("HTFMod 加载失败: " + _error);
+            throw new InvalidOperationException("HTFMod load failed: " + _error);
     }
 
     private static void PollForMainThread()
     {
         try
         {
-            for (int i = 0; i < 120; i++) // 最多等 60s
+            for (int i = 0; i < 120; i++) // up to 60s
             {
                 var ctx = FindUnitySyncContext();
                 if (ctx != null)
                 {
                     ctx.Post(_ => Boot(), null);
-                    // Boot 在主线程跑完才置 Ok;继续等,错误也会被捕获
+                    // Wait until Boot finished on the main thread; errors are captured too.
                     var sw = Stopwatch.StartNew();
                     while (!Ok && _error == null && sw.ElapsedMilliseconds < 30000)
                         Thread.Sleep(100);
@@ -52,18 +54,19 @@ public static class Loader
                 }
                 Thread.Sleep(500);
             }
-            _error = "60s 内未找到 Unity 主线程同步上下文";
+            _error = "Unity main-thread sync context not found within 60s";
         }
         catch (Exception e)
         {
             _error = e.Message;
-            Log("PollForMainThread 异常: " + e);
+            Log("PollForMainThread exception: " + e);
         }
     }
 
     private static SynchronizationContext FindUnitySyncContext()
     {
-        // Unity 6: UnitySynchronizationContext 实例存在 Awaitable._synchronizationContext (private static)
+        // Unity 6: the UnitySynchronizationContext instance lives in
+        // Awaitable._synchronizationContext (private static).
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             AssemblyName an;
@@ -88,12 +91,12 @@ public static class Loader
         {
             ModCore.Initialize();
             Ok = true;
-            Log("HTFMod v" + Version + " 已就绪 (主线程)");
+            Log("HTFMod v" + Version + " ready (main thread)");
         }
         catch (Exception e)
         {
             _error = e.Message;
-            Log("Boot 异常: " + e);
+            Log("Boot exception: " + e);
         }
     }
 
@@ -105,6 +108,6 @@ public static class Loader
                 Path.Combine(Path.GetTempPath(), "htf-mod.log"),
                 $"[{DateTime.Now:HH:mm:ss.fff}] {msg}{Environment.NewLine}");
         }
-        catch { /* 忽略日志失败 */ }
+        catch { /* ignore logging failures */ }
     }
 }

@@ -3,6 +3,10 @@ using UnityEngine;
 
 namespace HTFMod;
 
+/// <summary>
+/// Per-frame driver for every cheat feature. Lives on a DontDestroyOnLoad object
+/// created by ModCore. INSERT toggles the menu; OnGUI draws it.
+/// </summary>
 public class CheatController : MonoBehaviour
 {
     public bool MenuOpen;
@@ -13,7 +17,6 @@ public class CheatController : MonoBehaviour
     private float _moveTimer;
     private float _boatTimer;
     private bool _itemsCached;
-    private bool _cheatsInit;
 
     private void Start()
     {
@@ -45,12 +48,6 @@ public class CheatController : MonoBehaviour
                 }
             }
 
-            if (!_cheatsInit)
-            {
-                // 首次进对局时同步一次游戏内置作弊状态
-                _cheatsInit = true;
-            }
-
             _vitalsTimer += Time.deltaTime;
             if (_vitalsTimer >= 0.4f)
             {
@@ -74,7 +71,7 @@ public class CheatController : MonoBehaviour
         }
         catch (Exception e)
         {
-            Loader.Log("Update 异常: " + e);
+            Loader.Log("Update exception: " + e);
         }
     }
 
@@ -86,7 +83,7 @@ public class CheatController : MonoBehaviour
         }
         catch (Exception e)
         {
-            Loader.Log("OnGUI 异常: " + e);
+            Loader.Log("OnGUI exception: " + e);
         }
     }
 

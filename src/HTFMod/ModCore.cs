@@ -1,8 +1,11 @@
-using System;
 using UnityEngine;
 
 namespace HTFMod;
 
+/// <summary>
+/// Creates the persistent cheat-controller object on the Unity main thread.
+/// Both entry points (BepInEx plugin Awake and the legacy CLI-injector Loader) call this.
+/// </summary>
 public static class ModCore
 {
     public static CheatController Controller { get; private set; }
