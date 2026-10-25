@@ -1,0 +1,41 @@
+using System;
+using UnityEngine;
+
+namespace MetaVoiceChat.Utils;
+
+[Serializable]
+public class MetaSerializableReactiveProperty<T> where T : IEquatable<T>
+{
+	[SerializeField]
+	private T value;
+
+	public T Value
+	{
+		get
+		{
+			return value;
+		}
+		set
+		{
+			if (value == null)
+			{
+				if (this.value != null)
+				{
+					this.OnValueChanged?.Invoke(value);
+				}
+			}
+			else if (!value.Equals(this.value))
+			{
+				this.OnValueChanged?.Invoke(value);
+			}
+			this.value = value;
+		}
+	}
+
+	public event Action<T> OnValueChanged;
+
+	public static implicit operator T(MetaSerializableReactiveProperty<T> value)
+	{
+		return value.Value;
+	}
+}
