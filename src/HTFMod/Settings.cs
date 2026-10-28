@@ -67,7 +67,10 @@ public static class Settings
         B("SilentAimPlayers", () => Features.SilentAimPlayers, v => Features.SilentAimPlayers = v, true);
         B("SilentAimCreatures", () => Features.SilentAimCreatures, v => Features.SilentAimCreatures = v, true);
         F("SilentAimPlayerPoint", () => Features.SilentAimPlayerPoint, v => Features.SilentAimPlayerPoint = (int)v, 0f);
+        B("SilentAimAimBody", () => Features.SilentAimAimBody, v => Features.SilentAimAimBody = v, true);
+        B("SilentAimAimHead", () => Features.SilentAimAimHead, v => Features.SilentAimAimHead = v, false);
         B("SilentAimBodyIfLethal", () => Features.SilentAimBodyIfLethal, v => Features.SilentAimBodyIfLethal = v, true);
+        B("ForceCrit", () => Features.ForceCrit, v => Features.ForceCrit = v, false);
         F("SilentAimAngle", () => Features.SilentAimAngle, v => Features.SilentAimAngle = v, 60f);
         bool saMigrated = false;
         B("SilentAimSplitMigrated", () => saMigrated, v => saMigrated = v, false);
@@ -77,6 +80,18 @@ public static class Settings
             Features.SilentAimCreatures = Features.SilentAimTarget != 0;
             Features.SilentAimPlayerPoint = Features.SilentAimHead ? 1 : 0;
             saMigrated = true;
+            MarkDirty();
+        }
+        bool aimPtsMigrated = false;
+        B("SilentAimPointsMigrated", () => aimPtsMigrated, v => aimPtsMigrated = v, false);
+        if (!aimPtsMigrated)
+        {
+            bool head = Features.SilentAimPlayerPoint == 1 || Features.SilentAimHead;
+            Features.SilentAimAimHead = head;
+            Features.SilentAimAimBody = !head;
+            if (!Features.SilentAimAimBody && !Features.SilentAimAimHead)
+                Features.SilentAimAimBody = true;
+            aimPtsMigrated = true;
             MarkDirty();
         }
         B("CreatureEsp", () => Features.CreatureEsp, v => Features.CreatureEsp = v, false);

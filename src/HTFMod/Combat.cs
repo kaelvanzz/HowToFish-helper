@@ -214,9 +214,9 @@ public static class Combat
 
     /// <summary>
     /// Shared target search. Priority: 0 = closest to crosshair, 1 = closest distance,
-    /// 2 = lowest HP. aimHead aims at the head instead of the chest.
+    /// 2 = lowest HP. Aim point follows player body/head toggles, cover, and lethal-body.
     /// </summary>
-    internal static Player FindTarget(Vector3 camPos, Vector3 forward, float maxAngle, bool aimHead, int priority, float aimHeight, out Vector3 aimPoint)
+    internal static Player FindTarget(Vector3 camPos, Vector3 forward, float maxAngle, int priority, float aimHeight, out Vector3 aimPoint)
     {
         aimPoint = default;
         Player best = null;
@@ -230,7 +230,7 @@ public static class Combat
                 continue;
             try
             {
-                Vector3 tp = AimPointOf(pl, out var _, aimHead);
+                Vector3 tp = ResolvePlayerAim(pl, camPos);
                 Vector3 to = tp - camPos;
                 float dist = to.magnitude;
                 if (dist < 0.4f || dist > 200f)
@@ -276,7 +276,7 @@ public static class Combat
         Player bestP = null;
         Vector3 bestPAim = default;
         if (Features.SilentAimPlayers)
-            bestP = FindTarget(camPos, forward, Features.SilentAimAngle, WantPlayerHead(), Features.SilentAimPriority, Features.SilentAimHeight, out bestPAim);
+            bestP = FindTarget(camPos, forward, Features.SilentAimAngle, Features.SilentAimPriority, Features.SilentAimHeight, out bestPAim);
 
         Creature bestC = null;
         Vector3 bestCAim = default;
@@ -557,7 +557,7 @@ public static class Combat
             {
                 if (GetPlayerBounds(_lockedPlayer, out var b))
                 {
-                    Vector3 ap = ChestPoint(_lockedPlayer, b, AimHeadFor(_lockedPlayer));
+                    Vector3 ap = ResolvePlayerAim(_lockedPlayer, camPos);
                     if (LockValid(ap, camPos, forward, maxAngle))
                     {
                         _aimPoint = ap;
@@ -570,7 +570,7 @@ public static class Combat
             _aimActive = false;
 
             // Re-acquire: closest-to-crosshair alive player inside the cone
-            var best = FindTarget(camPos, forward, maxAngle, WantPlayerHead(), 0, 0.65f, out var bestAim);
+            var best = FindTarget(camPos, forward, maxAngle, 0, 0.65f, out var bestAim);
             if (best == null)
                 return;
 
@@ -635,22 +635,61 @@ public static class Combat
         Loader.Log("Aimbot error: " + e.Message);
     }
 
-    /// <summary>Head unless "body if lethal" and this shot would already kill.</summary>
-    private static bool WantPlayerHead()
+    /// <summary>
+    /// Pick body / head from the player-aim toggles. If both are on, prefer the
+    /// uncovered point (raycast along ProjectileHitLayer). "Body if lethal" only
+    /// steals the shot when both points are allowed and a body hit already kills.
+    /// Creatures never use this path.
+    /// </summary>
+    private static Vector3 ResolvePlayerAim(Player pl, Vector3 from)
     {
-        return Features.SilentAimPlayerPoint == 1 || Features.SilentAimHead;
+        bool wantBody = Features.SilentAimAimBody;
+        bool wantHead = Features.SilentAimAimHead || Features.SilentAimHead;
+        if (!wantBody && !wantHead)
+            wantBody = true;
+
+        Vector3 body = PlayerPoint(pl, false);
+        Vector3 head = PlayerPoint(pl, true);
+        if (wantBody && !wantHead)
+            return body;
+        if (wantHead && !wantBody)
+            return head;
+
+        bool bodyClear = PointClear(from, body, pl);
+        bool headClear = PointClear(from, head, pl);
+
+        if (Features.SilentAimBodyIfLethal && bodyClear)
+        {
+            int dmg = LocalShotDamage();
+            if (dmg > 0 && HealthOf(pl) <= dmg)
+                return body;
+        }
+
+        if (headClear && !bodyClear) return head;
+        if (bodyClear && !headClear) return body;
+        if (headClear) return head;
+        return body;
     }
 
-    private static bool AimHeadFor(Player pl)
+    private static bool PointClear(Vector3 from, Vector3 to, Player pl)
     {
-        if (!WantPlayerHead())
+        Vector3 delta = to - from;
+        float dist = delta.magnitude;
+        if (dist < 0.05f)
+            return true;
+        try
+        {
+            if (!Physics.Raycast(from, delta / dist, out var hit, dist - 0.04f,
+                    GameInfo.ProjectileHitLayer, QueryTriggerInteraction.Ignore))
+                return true;
+            var t = hit.transform;
+            if (t == null)
+                return false;
+            if (pl != null && pl.Transform != null && t.IsChildOf(pl.Transform))
+                return true;
             return false;
-        if (!Features.SilentAimBodyIfLethal)
-            return true;
-        int dmg = LocalShotDamage();
-        if (dmg <= 0)
-            return true;
-        return HealthOf(pl) > dmg;
+        }
+        catch { return true; }
     }
 
     private static int LocalShotDamage()
@@ -670,11 +709,9 @@ public static class Combat
         catch { return 0; }
     }
 
-    private static Vector3 AimPointOf(Player pl, out Bounds b, bool head = false)
+    private static Vector3 PlayerPoint(Player pl, bool head)
     {
-        if (head && Features.SilentAimBodyIfLethal && !AimHeadFor(pl))
-            head = false;
-        if (GetPlayerBounds(pl, out b))
+        if (GetPlayerBounds(pl, out var b))
             return ChestPoint(pl, b, head);
         return pl.Transform.position + Vector3.up * (head ? 1.6f : 1.35f);
     }

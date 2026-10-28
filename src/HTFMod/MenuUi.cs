@@ -46,6 +46,7 @@ public static class MenuUi
     private static List<PageDef> Pages => new List<PageDef>
     {
         new PageDef(L.T("玩家", "玩家", "Player"), TabPlayer),
+        new PageDef(L.T("金钱", "金錢", "Money"), TabMoney),
         new PageDef(L.T("战斗", "戰鬥", "Combat"), TabCombat),
         new PageDef(L.T("视觉", "視覺", "Visual"), TabVisual),
         new PageDef(L.T("物品", "物品", "Items"), TabItems),
@@ -218,7 +219,7 @@ public static class MenuUi
             }
 
             if (e.Creature ? Features.CreatureLabel : Features.ItemLabel)
-                DrawEspNameplate(boxR, e.Name, d, lc, fade);
+                DrawEspNameplate(cam, bb, e.Name, d, lc, fade);
         }
     }
 
@@ -358,25 +359,42 @@ public static class MenuUi
         return _espDistLabel;
     }
 
-    /// <summary>Name above the box, distance below — matches the common ESP layout.</summary>
-    private static void DrawEspNameplate(Rect box, string name, float dist, Color color, float fade)
+    /// <summary>
+    /// Name above the entity, distance below. Anchored to the world AABB top/bottom
+    /// (not the 2D box width) so rotating fish don't shake the text.
+    /// </summary>
+    private static void DrawEspNameplate(Camera cam, Bounds bb, string name, float dist, Color color, float fade)
     {
-        if (string.IsNullOrEmpty(name))
+        if (string.IsNullOrEmpty(name) || cam == null)
             return;
         name = name.Replace("<", "");
         string hex = ColorUtility.ToHtmlStringRGB(color);
         float a = Mathf.Clamp01(fade);
         int nameH = Mathf.Clamp(Features.LabelSize, 9, 24) + 3;
         int distH = Mathf.Clamp(Features.LabelSize - 2, 9, 16) + 2;
-        float labelW = Mathf.Max(box.width + 90f, 110f);
-        float cx = box.center.x;
+        string distStr = ((int)(dist + 0.5f)).ToString() + "m";
 
-        DrawEspText(new Rect(cx - labelW * 0.5f, box.y - nameH - 1f, labelW, nameH),
-            name, hex, a, EspLabel());
-        var distCol = Color.Lerp(new Color(0.62f, 0.66f, 0.70f), color, 0.35f);
-        string distHex = ColorUtility.ToHtmlStringRGB(distCol);
-        DrawEspText(new Rect(cx - labelW * 0.5f, box.yMax + 1f, labelW, distH),
-            ((int)(dist + 0.5f)).ToString() + "m", distHex, a * 0.78f, EspDistLabel());
+        float nameW = EspLabel().CalcSize(new GUIContent(name)).x + 8f;
+        float distW = EspDistLabel().CalcSize(new GUIContent(distStr)).x + 8f;
+
+        Vector3 st = cam.WorldToScreenPoint(new Vector3(bb.center.x, bb.max.y, bb.center.z));
+        Vector3 sb = cam.WorldToScreenPoint(new Vector3(bb.center.x, bb.min.y, bb.center.z));
+        if (st.z > 0.1f)
+        {
+            float cx = Mathf.Round(st.x);
+            float y = Mathf.Round(Screen.height - st.y);
+            DrawEspText(new Rect(cx - nameW * 0.5f, y - nameH - 1f, nameW, nameH),
+                name, hex, a, EspLabel());
+        }
+        if (sb.z > 0.1f)
+        {
+            var distCol = Color.Lerp(new Color(0.62f, 0.66f, 0.70f), color, 0.35f);
+            string distHex = ColorUtility.ToHtmlStringRGB(distCol);
+            float cx = Mathf.Round(sb.x);
+            float y = Mathf.Round(Screen.height - sb.y);
+            DrawEspText(new Rect(cx - distW * 0.5f, y + 1f, distW, distH),
+                distStr, distHex, a * 0.78f, EspDistLabel());
+        }
     }
 
     private static void DrawEspText(Rect r, string text, string hex, float alpha, GUIStyle style)
@@ -1119,7 +1137,10 @@ public static class MenuUi
                 y += 22;
             }
             if (_pickerSlot != null && _pickerAction == _bindPopup[0])
+            {
                 DrawColorPicker(_bindPopup[0], _pickerSlot, y, w.width - 20);
+                y += 132;
+            }
         }
 
         // clear all binds shown in this popup
@@ -1564,7 +1585,7 @@ public static class MenuUi
                     if (Features.PlayerLabel)
                     {
                         string name = (pl.SteamName ?? L.T("玩家", "玩家", "Player")).Replace("<", "");
-                        DrawEspNameplate(r, name, dist, bc, 1f);
+                        DrawEspNameplate(cam, b, name, dist, bc, 1f);
                     }
                 }
 
@@ -1997,14 +2018,16 @@ public static class MenuUi
 
     // ────────────────────────── tab: money ──────────────────────────
 
+    private static string _moneyAmt = "99999";
+
     private static void TabMoney(CheatController c)
     {
         BeginSection(L.T("钱包", "錢包", "Wallet"));
         if (!_fold)
         {
-            GUI.Label(new Rect(0, _y, 200, 20), L.T("现金", "現金", "Cash") + $"  <color=#3DE0D1>${MoneyManager.Money:N0}</color>", _label);
-            GUI.Label(new Rect(0, _y + 22, 200, 20), L.T("欧元", "歐元", "Euros") + $"  <color=#3DE0D1>€{MoneyManager.Euro:N0}</color>", _label);
-            _y += 48;
+            GUILayout.Label(L.T("现金", "現金", "Cash") + $"  <color=#3DE0D1>${MoneyManager.Money:N0}</color>", _label);
+            GUILayout.Label(L.T("欧元", "歐元", "Euros") + $"  <color=#3DE0D1>€{MoneyManager.Euro:N0}</color>", _label);
+            GUILayout.Space(6);
         }
         EndSection();
 
@@ -2018,6 +2041,23 @@ public static class MenuUi
             if (Features.HostAct(CheatAction.AddMoney, amount: 999, currency: (byte)Currency.Euro))
                 c.ShowToast(L.T("已加 €999", "已加 €999", "Added €999"));
         });
+        if (!_fold)
+        {
+            var r = GUILayoutUtility.GetRect(0, 32, GUILayout.ExpandWidth(true));
+            GUI.Label(new Rect(r.x, r.y + 6, 54, 20), L.T("数量", "數量", "Amount"), _label);
+            _moneyAmt = GUI.TextField(new Rect(r.x + 58, r.y + 4, 90, 24), _moneyAmt, 9, _btn);
+            bool ok = int.TryParse(_moneyAmt, out int amt) && amt != 0 && Features.CanHostAct;
+            DrawButton(new Rect(r.xMax - 132, r.y + 2, 62, 26), "+$", ok, () =>
+            {
+                if (Features.HostAct(CheatAction.AddMoney, amount: amt, currency: (byte)Currency.Dollar))
+                    c.ShowToast(L.T("已加 $", "已加 $", "Added $") + amt.ToString("N0"));
+            });
+            DrawButton(new Rect(r.xMax - 66, r.y + 2, 62, 26), "+€", ok, () =>
+            {
+                if (Features.HostAct(CheatAction.AddMoney, amount: amt, currency: (byte)Currency.Euro))
+                    c.ShowToast(L.T("已加 €", "已加 €", "Added €") + amt.ToString("N0"));
+            });
+        }
         EndSection();
 
         BeginSection(L.T("开关", "開關", "Toggles"));
@@ -2194,6 +2234,9 @@ public static class MenuUi
             L.T("你打出的每一击都是十万伤害", "你打出的每一擊都是十萬傷害", "Everything you hit takes 100,000 damage"),
             Features.SelfOneShot, true, v => FeatureActions.Apply("SelfOneShot", v),
             new[] { "SelfOneShot" });
+        ToggleRow(L.T("强制暴击", "強制暴擊", "Force crit"),
+            L.T("打生物无论打到哪都按爆头结算", "打生物無論打到哪都按爆頭結算", "Creature hits always count as headshots"),
+            Features.ForceCrit, true, v => { Features.ForceCrit = v; Settings.MarkDirty(); });
         EndSection();
 
         BeginSection(L.T("射击", "射擊", "Shooting"));
@@ -2229,12 +2272,13 @@ public static class MenuUi
             L.T("按住触发键自动跟踪其他玩家(默认右键,右键行可改绑)", "按住觸發鍵自動跟蹤其他玩家(預設右鍵,右鍵行可改綁)", "Hold the trigger to lock the nearest player"),
             Features.Aimbot, true, v => FeatureActions.Apply("Aimbot", v),
             new[] { "Aimbot", Hotkeys.AimbotTrigger });
-        OptionRow(L.T("瞄准部位", "瞄準部位", "Aim point"),
-            new[] { L.T("身体", "身體", "Body"), L.T("头部", "頭部", "Head") },
-            ref Features.SilentAimPlayerPoint);
-        Features.SilentAimHead = Features.SilentAimPlayerPoint == 1;
-        ToggleRow(L.T("能一枪死打身体", "能一槍死打身體", "Body if lethal"),
-            L.T("开头部时,这一枪已经能打死就改打身体", "開頭部時,這一槍已經能打死就改打身體", "If a body shot already kills, aim body instead of head"),
+        ChipToggleRow(L.T("瞄准部位", "瞄準部位", "Aim point"),
+            L.T("身体", "身體", "Body"), ref Features.SilentAimAimBody,
+            L.T("头部", "頭部", "Head"), ref Features.SilentAimAimHead);
+        Features.SilentAimHead = Features.SilentAimAimHead;
+        Features.SilentAimPlayerPoint = Features.SilentAimAimHead && !Features.SilentAimAimBody ? 1 : 0;
+        ToggleRow(L.T("致命时打身体", "致命時打身體", "Body if lethal"),
+            L.T("打身体已经能打死时优先打身体; 多选部位时还会避开掩体", "打身體已經能打死時優先打身體; 多選部位時還會避開掩體", "Prefer body when a body shot already kills; with both points on, skip covered parts"),
             Features.SilentAimBodyIfLethal, true, v => { Features.SilentAimBodyIfLethal = v; Settings.MarkDirty(); });
         SliderRow(L.T("自瞄强度", "自瞄強度", "Smoothing"), ref Features.AimbotStrength, 0.1f, 1f, "");
         SliderRow(L.T("瞄准范围", "瞄準範圍", "Lock cone"), ref Features.AimbotMaxAngle, 5f, 90f, "°");
@@ -2634,6 +2678,34 @@ public static class MenuUi
         if (!Mathf.Approximately(snapped, value))
             Settings.MarkDirty();
         value = snapped;
+    }
+
+    /// <summary>Two independent chips; at least one stays on.</summary>
+    private static void ChipToggleRow(string label, string a, ref bool va, string b, ref bool vb)
+    {
+        if (_fold)
+            return;
+        var r = GUILayoutUtility.GetRect(0, 30, GUILayout.ExpandWidth(true));
+        GUI.Label(new Rect(r.x, r.y + 5, r.width - 205, 20), label, _label);
+        float bw = 62;
+        var ra = new Rect(r.xMax - 200, r.y + 3, bw, 24);
+        var rb = new Rect(r.xMax - 200 + bw + 3, r.y + 3, bw, 24);
+        if (GUI.Button(ra, a, va ? _btnAccent : _btn))
+        {
+            if (!(va && !vb))
+            {
+                va = !va;
+                Settings.MarkDirty();
+            }
+        }
+        if (GUI.Button(rb, b, vb ? _btnAccent : _btn))
+        {
+            if (!(vb && !va))
+            {
+                vb = !vb;
+                Settings.MarkDirty();
+            }
+        }
     }
 
     /// <summary>Segmented option picker (e.g. fire mode: click / hold / hold+click).</summary>

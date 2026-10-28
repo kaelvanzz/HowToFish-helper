@@ -37,8 +37,11 @@ public static class Features
     public static bool SilentAimPlayers = true;
     public static bool SilentAimCreatures = true;
     public static bool SilentAimHead;         // aim at the head instead of the chest (legacy)
-    public static int SilentAimPlayerPoint;   // 0 body / 1 head — visual aimbot + silent aim vs players
-    public static bool SilentAimBodyIfLethal = true; // if one shot kills, aim body instead of head
+    public static int SilentAimPlayerPoint;   // 0 body / 1 head (legacy exclusive)
+    public static bool SilentAimAimBody = true;  // allow body as a player aim point
+    public static bool SilentAimAimHead;         // allow head as a player aim point
+    public static bool SilentAimBodyIfLethal = true; // if a body shot already kills, prefer body
+    public static bool ForceCrit;                    // creature hits always count as headshots
     public static float SilentAimAngle = 60f; // target search cone (deg)
     public static bool CreatureEsp;             // creature boxes + name tags through walls
     public static bool CreatureLabel = true;    // name+distance text over creature boxes

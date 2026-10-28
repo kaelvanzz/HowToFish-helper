@@ -473,6 +473,33 @@ internal static class Patch_Item_LocalHit
     }
 }
 
+/// <summary>
+/// Force-crit for creatures: rewrite the hit point just past HeadPos so the
+/// vanilla headshot multiplier (and headshot killscore) always fires.
+/// </summary>
+[HarmonyPatch(typeof(Creature), "LocalHit")]
+internal static class Patch_Creature_ForceCrit
+{
+    private static void Prefix(Creature __instance, ref Vector3 point, bool rangedHit, Player player)
+    {
+        if (!Features.ForceCrit || !rangedHit)
+            return;
+        if (player == null || player != Player.LocalPlayer)
+            return;
+        try
+        {
+            var t = __instance.transform;
+            Vector3 local = t.InverseTransformPoint(point);
+            if (local.z <= __instance.HeadPos)
+            {
+                local.z = __instance.HeadPos + 0.08f;
+                point = t.TransformPoint(local);
+            }
+        }
+        catch { }
+    }
+}
+
 [HarmonyPatch(typeof(PlayerVitals), "LocalHit")]
 internal static class Patch_PlayerVitals_LocalHit_Damage
 {
