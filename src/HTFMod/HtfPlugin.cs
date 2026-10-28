@@ -6,7 +6,7 @@ using System.Reflection;
 
 namespace HTFMod;
 
-[BepInPlugin("htf.cheatmenu", "How to Fish 鱼塘改造器", "1.1.0")]
+[BepInPlugin("htf.cheatmenu", "How to Fish 鱼塘改造器", "1.3.0")]
 public class HtfPlugin : BaseUnityPlugin
 {
     private ConfigEntry<string> _lang;
@@ -70,7 +70,7 @@ public class HtfPlugin : BaseUnityPlugin
             }
 
             ModCore.Initialize();
-            Logger.LogInfo($"HTFMod v1.1 loaded — patches {ok} ok / {fail} failed, press INSERT for menu");
+            Logger.LogInfo($"HTFMod v1.3 loaded — patches {ok} ok / {fail} failed, press INSERT for menu");
         }
         catch (System.Exception e)
         {

@@ -2681,7 +2681,7 @@ public static class MenuUi
 
     private static void DrawHudHint(CheatController c)
     {
-        string txt = L.T("INSERT 打开菜单 · HTFMod v1.1", "INSERT 開啟選單 · HTFMod v1.1", "INSERT opens menu · HTFMod v1.1");
+        string txt = L.T("INSERT 打开菜单 · HTFMod v1.3", "INSERT 開啟選單 · HTFMod v1.3", "INSERT opens menu · HTFMod v1.3");
         var size = _hint.CalcSize(new GUIContent(txt));
         var r = new Rect(Screen.width - size.x - 14, Screen.height - size.y - 10, size.x + 16, size.y + 8);
         DrawFill(r, new Color(0, 0, 0, 0.45f));

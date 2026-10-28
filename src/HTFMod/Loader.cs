@@ -17,7 +17,7 @@ public static class Loader
     public const string Namespace = "HTFMod";
     public const string ClassName = "Loader";
     public const string MethodName = "Load";
-    public const string Version = "1.1";
+    public const string Version = "1.3";
 
     public static volatile bool Ok;
     private static volatile string _error;
