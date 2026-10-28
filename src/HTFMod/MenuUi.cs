@@ -24,30 +24,45 @@ public static class MenuUi
     private static readonly Color CWarn = new(0.96f, 0.78f, 0.38f, 1f);
     private static readonly Color CDanger = new(0.94f, 0.44f, 0.44f, 1f);
 
-    private const float WinW = 430f;
+    private const float WinW = 470f;
 
     /// <summary>Window height: tall enough for the biggest tab on 1080p+,
     /// shrinks on small screens; the tab scrollview handles any leftover overflow.</summary>
-    private static float WinH => Mathf.Min(740f, Screen.height - 130f);
+    private static float WinH => Mathf.Min(800f, Screen.height - 110f);
 
     private static Rect _win = new Rect(80, 80, WinW, WinH);
-    private static int _tab;
+    private static int _page;
     private static Vector2 _scroll;
     private static Vector2 _tabScroll;
 
-    private static string[] Tabs => new[]
+    private class PageDef
     {
-        L.T("玩家", "玩家", "Player"),
-        L.T("金钱", "金錢", "Money"),
-        L.T("物品", "物品", "Items"),
-        L.T("战斗", "戰鬥", "Combat"),
-        L.T("载具", "載具", "Vehicle"),
-        L.T("玩乐", "玩樂", "Fun"),
-        L.T("按键", "按鍵", "Keys"),
+        public string Label;
+        public Action<CheatController> Draw;
+        public PageDef(string label, Action<CheatController> draw) { Label = label; Draw = draw; }
+    }
+
+    /// <summary>Sidebar navigation pages (regrouped: money→world, fun→player/world).</summary>
+    private static List<PageDef> Pages => new List<PageDef>
+    {
+        new PageDef(L.T("玩家", "玩家", "Player"), TabPlayer),
+        new PageDef(L.T("战斗", "戰鬥", "Combat"), TabCombat),
+        new PageDef(L.T("视觉", "視覺", "Visual"), TabVisual),
+        new PageDef(L.T("物品", "物品", "Items"), TabItems),
+        new PageDef(L.T("世界", "世界", "World"), TabWorld),
+        new PageDef(L.T("赌场", "賭場", "Casino"), TabCasino),
+        new PageDef(L.T("钓鱼", "釣魚", "Fishing"), TabFishing),
+        new PageDef(L.T("载具", "載具", "Vehicle"), TabBoat),
+        new PageDef(L.T("按键", "按鍵", "Keys"), TabKeys),
     };
+
+    private const float NavW = 104f;
+    private const float NavGap = 16f;
 
     // hotkey rebinding: which action is waiting for a key press (null = none)
     private static string _listening;
+    private static string _pickerAction; // action owning the expanded color picker
+    private static string _pickerSlot;   // which color slot is expanded ("box"/"fill"/...)
 
     private static Font _font;
     private static bool _stylesReady;
@@ -97,9 +112,684 @@ public static class MenuUi
 
         DrawIslandLabels();
         DrawPlayerEsp();
+        DrawLootEsp();
         DrawCrosshair(c);
+        DrawActiveHud(c);
         DrawRouletteHud();
+        DrawSlotsHud();
         DrawToast(c);
+    }
+
+    // ────────────────────────── item / creature ESP ──────────────────────────
+
+    private sealed class LootEntry
+    {
+        public Component Obj;
+        public string Name;
+        public bool Creature;
+        public bool Dead;            // dead creature (loot)
+        public Collider[] Cols;      // all colliders — live .bounds every frame (hitbox)
+        public Renderer[] Rends;     // fallback when there is no collider
+        public Bounds Bounds;        // last-scan AABB, only used if colliders/renderers vanish
+        public Vector3 BoundsOffset; // box center relative to the object position
+    }
+
+    private static readonly List<LootEntry> _loot = new();
+    private static float _lootNextScan;
+    private static bool _scanCreaturesNow = true;
+
+    /// <summary>
+    /// Creature/item ESP. Positions are read every frame from live transforms;
+    /// object lists are scanned on a timer. Default look is a tight 2D outline
+    /// with the name above the box and distance below — unobtrusive, readable.
+    /// </summary>
+    private static void DrawLootEsp()
+    {
+        if (!Features.CreatureEsp && !Features.ItemEsp)
+        {
+            _loot.Clear();
+            return;
+        }
+        var cam = GameInfo.CurCamera;
+        if (cam == null || Player.LocalPlayer == null)
+            return;
+
+        // time-sliced scan: one phase (creatures OR items) per tick — the old
+        // full-scan-in-one-frame caused the periodic hitch
+        if (Time.unscaledTime >= _lootNextScan)
+        {
+            _lootNextScan = Time.unscaledTime + 0.18f;
+            _scanCreaturesNow = !_scanCreaturesNow;
+            RescanLoot(_scanCreaturesNow);
+        }
+
+        for (int i = _loot.Count - 1; i >= 0; i--)
+        {
+            var e = _loot[i];
+            if (e.Obj == null)
+            {
+                _loot.RemoveAt(i);
+                continue;
+            }
+            if (!TryLootBounds(e, out var bb))
+                continue;
+
+            Vector3 sp = cam.WorldToScreenPoint(bb.center);
+            if (sp.z <= 0.1f)
+                continue;
+            float maxDist = e.Creature ? Features.CreatureEspDist : Features.ItemEspDist;
+            float d = Vector3.Distance(Player.LocalPlayer.Transform.position, bb.center);
+            if (d > maxDist)
+                continue;
+
+            float fade = EspDistanceFade(d, maxDist);
+            var lc = EspColor(e.Creature ? Features.EspCreatureColor : Features.EspItemColor);
+            var lineCol = lc;
+            lineCol.a = Mathf.Clamp01(e.Creature ? Features.CreatureEspAlpha : Features.ItemEspAlpha) * fade;
+
+            Rect boxR;
+            if (!ProjectBounds(bb, cam, out boxR, out _))
+                boxR = new Rect(sp.x - 5f, Screen.height - sp.y - 5f, 10f, 10f);
+
+            if (e.Creature)
+            {
+                if (Features.CreatureFill)
+                {
+                    var fillCol = EspColor(Features.EspCreatureFillColor);
+                    fillCol.a = Mathf.Clamp01(Features.CreatureFillAlpha) * fade;
+                    DrawEspSoftFill(boxR, fillCol);
+                }
+                if (Features.CreatureFrame)
+                    DrawEspFrame(boxR, lineCol, true);
+                if (Features.CreatureSilhouette)
+                    DrawCreatureSilhouette(e.Obj, cam, lineCol);
+            }
+            else
+            {
+                bool frame = Features.ItemFrame || Features.ItemEspStyle >= 1;
+                if (Features.ItemFill)
+                {
+                    var fillCol = EspColor(Features.EspItemFillColor);
+                    fillCol.a = Mathf.Clamp01(Features.ItemFillAlpha) * fade;
+                    DrawEspSoftFill(boxR, fillCol);
+                }
+                if (frame)
+                    DrawEspFrame(boxR, lineCol, true);
+            }
+
+            if (e.Creature ? Features.CreatureLabel : Features.ItemLabel)
+                DrawEspNameplate(boxR, e.Name, d, lc, fade);
+        }
+    }
+
+    private static bool TryLootBounds(LootEntry e, out Bounds bb)
+    {
+        if (TryLiveBounds(e, out bb))
+            return true;
+        if (e.Bounds.size.sqrMagnitude > 0.0001f)
+        {
+            bb = new Bounds(e.Obj.transform.position + e.BoundsOffset, e.Bounds.size);
+            return true;
+        }
+        bb = new Bounds(e.Obj.transform.position + Vector3.up * 0.2f, new Vector3(0.3f, 0.3f, 0.3f));
+        return true;
+    }
+
+    /// <summary>
+    /// Live world AABB: union of every enabled collider (the real hitbox). Falls back
+    /// to renderers so items without a collider still hug the mesh, including when
+    /// you walk right up to them.
+    /// </summary>
+    private static bool TryLiveBounds(LootEntry e, out Bounds bb)
+    {
+        bb = default;
+        bool any = false;
+        if (e.Cols != null)
+        {
+            for (int i = 0; i < e.Cols.Length; i++)
+            {
+                var c = e.Cols[i];
+                if (c == null || !c.enabled) continue;
+                if (!any) { bb = c.bounds; any = true; }
+                else bb.Encapsulate(c.bounds);
+            }
+        }
+        if (any && bb.size.sqrMagnitude > 0.0001f)
+            return true;
+
+        any = false;
+        Vector3 origin = e.Obj != null ? e.Obj.transform.position : Vector3.zero;
+        if (e.Rends != null)
+        {
+            for (int i = 0; i < e.Rends.Length; i++)
+            {
+                var r = e.Rends[i];
+                if (r == null || !r.enabled) continue;
+                var rb = r.bounds;
+                if ((rb.center - origin).sqrMagnitude > 25f) continue;
+                if (!any) { bb = rb; any = true; }
+                else bb.Encapsulate(rb);
+            }
+        }
+        return any && bb.size.sqrMagnitude > 0.0001f;
+    }
+
+    /// <summary>Project the 8 corners of a world AABB to a tight screen-space rect.</summary>
+    private static bool ProjectBounds(Bounds bb, Camera cam, out Rect box, out float dist)
+    {
+        box = default;
+        Vector3 c = bb.center;
+        Vector3 e = bb.extents;
+        Vector3 spc = cam.WorldToScreenPoint(c);
+        dist = spc.z;
+        if (dist <= 0.1f)
+            return false;
+
+        float minX = float.PositiveInfinity, minY = float.PositiveInfinity;
+        float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity;
+        int hits = 0;
+        for (int i = 0; i < 8; i++)
+        {
+            var p = c + new Vector3(
+                (i & 1) == 0 ? -e.x : e.x,
+                (i & 2) == 0 ? -e.y : e.y,
+                (i & 4) == 0 ? -e.z : e.z);
+            Vector3 s = cam.WorldToScreenPoint(p);
+            if (s.z <= 0.05f)
+                continue;
+            float y = Screen.height - s.y;
+            if (s.x < minX) minX = s.x;
+            if (s.x > maxX) maxX = s.x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            hits++;
+        }
+        if (hits == 0)
+            return false;
+
+        const float pad = 2f;
+        minX -= pad; maxX += pad; minY -= pad; maxY += pad;
+        float rawW = maxX - minX;
+        float rawH = maxY - minY;
+        float w = Mathf.Max(10f, rawW);
+        float h = Mathf.Max(10f, rawH);
+        minX -= (w - rawW) * 0.5f;
+        minY -= (h - rawH) * 0.5f;
+        box = new Rect(minX, minY, w, h);
+        if (box.xMax < -40f || box.x > Screen.width + 40f || box.yMax < -40f || box.y > Screen.height + 40f)
+            return false;
+        return true;
+    }
+
+    private static float EspDistanceFade(float d, float maxDist)
+    {
+        if (d <= 90f) return 1f;
+        float far = Mathf.Max(maxDist, 91f);
+        return Mathf.Lerp(0.5f, 1f, Mathf.InverseLerp(far, 90f, d));
+    }
+
+    private static void DrawEspFrame(Rect r, Color color, bool corners)
+    {
+        var under = new Color(0f, 0f, 0f, Mathf.Clamp01(color.a) * 0.5f);
+        if (corners)
+        {
+            DrawEspCorners(r, under);
+            DrawEspCorners(r, color);
+        }
+        else
+        {
+            DrawEspOutline(r, under, 2f);
+            DrawEspOutline(r, color, 1f);
+        }
+    }
+
+    private static GUIStyle _espDistLabel;
+    private static int _espDistBuilt = -1;
+
+    private static GUIStyle EspDistLabel()
+    {
+        int sz = Mathf.Clamp(Features.LabelSize - 2, 9, 16);
+        if (_espDistLabel == null || _espDistBuilt != sz)
+        {
+            _espDistLabel = Style(null, CText, sz, rich: true);
+            _espDistLabel.alignment = TextAnchor.MiddleCenter;
+            _espDistBuilt = sz;
+        }
+        return _espDistLabel;
+    }
+
+    /// <summary>Name above the box, distance below — matches the common ESP layout.</summary>
+    private static void DrawEspNameplate(Rect box, string name, float dist, Color color, float fade)
+    {
+        if (string.IsNullOrEmpty(name))
+            return;
+        name = name.Replace("<", "");
+        string hex = ColorUtility.ToHtmlStringRGB(color);
+        float a = Mathf.Clamp01(fade);
+        int nameH = Mathf.Clamp(Features.LabelSize, 9, 24) + 3;
+        int distH = Mathf.Clamp(Features.LabelSize - 2, 9, 16) + 2;
+        float labelW = Mathf.Max(box.width + 90f, 110f);
+        float cx = box.center.x;
+
+        DrawEspText(new Rect(cx - labelW * 0.5f, box.y - nameH - 1f, labelW, nameH),
+            name, hex, a, EspLabel());
+        var distCol = Color.Lerp(new Color(0.62f, 0.66f, 0.70f), color, 0.35f);
+        string distHex = ColorUtility.ToHtmlStringRGB(distCol);
+        DrawEspText(new Rect(cx - labelW * 0.5f, box.yMax + 1f, labelW, distH),
+            ((int)(dist + 0.5f)).ToString() + "m", distHex, a * 0.78f, EspDistLabel());
+    }
+
+    private static void DrawEspText(Rect r, string text, string hex, float alpha, GUIStyle style)
+    {
+        int sa = Mathf.Clamp(Mathf.RoundToInt(170f * alpha), 0, 255);
+        int ma = Mathf.Clamp(Mathf.RoundToInt(255f * alpha), 0, 255);
+        GUI.Label(new Rect(r.x + 1f, r.y + 1f, r.width, r.height),
+            $"<color=#000000{sa:X2}>{text}</color>", style);
+        GUI.Label(r, $"<color=#{hex}{ma:X2}>{text}</color>", style);
+    }
+
+    /// <summary>
+    /// Scan one loot phase (creatures or items), alternating so the
+    /// FindObjectsByType spike never lands twice in the same frame.
+    /// Existing entries are MERGED in place — nothing flickers between scans.
+    /// Caps: 20 nearest creatures / 25 nearest items+dead-fish.
+    /// </summary>
+    private static void RescanLoot(bool creatures)
+    {
+        try
+        {
+            if (creatures && Features.CreatureEsp)
+            {
+                // creatures: merge, keep the 20 nearest
+                var cand = new List<(Creature cr, float d)>();
+                foreach (var cr in UnityEngine.Object.FindObjectsByType<Creature>(
+                    FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+                {
+                    if (cr == null)
+                        continue;
+                    try
+                    {
+                        if (!cr.IsSpawned || cr.IsDead)
+                            continue;
+                        var d = (cr.transform.position - Player.LocalPlayer.Transform.position).sqrMagnitude;
+                        if (d < Features.CreatureEspDist * Features.CreatureEspDist)
+                            cand.Add((cr, d));
+                    }
+                    catch { continue; }
+                }
+                var seenC = new HashSet<Component>();
+                var nameCount = new Dictionary<string, int>();
+                var pickedC = new List<Creature>();
+                foreach (var (cr, _) in cand.OrderBy(c => c.d))
+                {
+                    string nm = ItemDb.NameOf(cr) ?? "";
+                    nameCount.TryGetValue(nm, out int n);
+                    if (n >= 6) continue; // same-species cap — a piranha ball stays quiet
+                    nameCount[nm] = n + 1;
+                    pickedC.Add(cr);
+                    if (pickedC.Count >= 20) break;
+                }
+                foreach (var cr in pickedC)
+                {
+                    try
+                    {
+                        seenC.Add(cr);
+                        var e = _loot.FirstOrDefault(x => x.Obj == cr);
+                        if (e == null)
+                        {
+                            e = new LootEntry { Obj = cr, Creature = true };
+                            _loot.Add(e);
+                        }
+                        e.Name = ItemDb.NameOf(cr);
+                        e.Cols = cr.GetComponentsInChildren<Collider>();
+                        e.Rends = cr.GetComponentsInChildren<Renderer>();
+                        if (TryLiveBounds(e, out var bbScan))
+                        {
+                            e.Bounds = bbScan;
+                            e.BoundsOffset = bbScan.center - cr.transform.position;
+                        }
+                    }
+                    catch { continue; }
+                }
+                for (int i = _loot.Count - 1; i >= 0; i--)
+                {
+                    var x = _loot[i];
+                    if (x.Creature && (x.Obj == null || !seenC.Contains(x.Obj)))
+                        _loot.RemoveAt(i);
+                }
+            }
+
+            if (!creatures && Features.ItemEsp)
+            {
+                // items + dead fish: merge, keep the 80 nearest
+                var cand = new List<(Component obj, float d, bool dead)>();
+                foreach (var it in UnityEngine.Object.FindObjectsByType<Item>(
+                    FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+                {
+                    if (it == null)
+                        continue;
+                    try
+                    {
+                        if (it.IsInInventory || it.IsDeinitializing || !it.IsSpawned)
+                            continue;
+                        var h = it.SyncedHolder ?? it.Holder;
+                        if (h != null)
+                            continue;
+                        bool dead = false;
+                        if (it is Creature crc)
+                        {
+                            if (!crc.IsDead)
+                                continue; // live creatures belong to the creature phase
+                            dead = true;
+                        }
+                        var d = (it.transform.position - Player.LocalPlayer.Transform.position).sqrMagnitude;
+                        if (d < Features.ItemEspDist * Features.ItemEspDist)
+                            cand.Add((it, d, dead));
+                    }
+                    catch { continue; }
+                }
+                var seenI = new HashSet<Component>();
+                foreach (var (obj, _, dead) in cand.OrderBy(c => c.d).Take(80))
+                {
+                    try
+                    {
+                        seenI.Add(obj);
+                        var e = _loot.FirstOrDefault(x => x.Obj == obj);
+                        if (e == null)
+                        {
+                            e = new LootEntry { Obj = obj, Creature = false };
+                            _loot.Add(e);
+                        }
+                        e.Name = ItemDb.NameOf((Item)obj);
+                        e.Dead = dead;
+                        e.Cols = obj.GetComponentsInChildren<Collider>();
+                        e.Rends = obj.GetComponentsInChildren<Renderer>();
+                        if (TryLiveBounds(e, out var bbScan))
+                        {
+                            e.Bounds = bbScan;
+                            e.BoundsOffset = bbScan.center - obj.transform.position;
+                        }
+                    }
+                    catch { continue; }
+                }
+                for (int i = _loot.Count - 1; i >= 0; i--)
+                {
+                    var x = _loot[i];
+                    if (!x.Creature && (x.Obj == null || !seenI.Contains(x.Obj)))
+                        _loot.RemoveAt(i);
+                }
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Topology for a true silhouette: vertices welded by position (so UV seams
+    /// do not become "every triangle is a boundary"), then only edges whose two
+    /// faces disagree on camera-facing are drawn. No fill.
+    /// </summary>
+    private sealed class SilCache
+    {
+        public Mesh Bake = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+        public int[] Weld;
+        public int WeldCount;
+        public int[] EA, EB, ET1, ET2;
+        public int[] T0, T1, T2;
+        public int OrigVc, OrigTc;
+        public Vector3[] World;
+        public bool[] Front;
+    }
+
+    private static readonly Dictionary<SkinnedMeshRenderer, SilCache> _silCache = new();
+    private static readonly Dictionary<MeshFilter, SilCache> _silCacheMf = new();
+    private static readonly Dictionary<long, int> _weldMap = new();
+    private static float _silPruneAt;
+
+    private static SilCache NewSilCache() =>
+        new SilCache { Bake = new Mesh { hideFlags = HideFlags.HideAndDontSave } };
+
+    private static void DrawCreatureSilhouette(Component obj, Camera cam, Color col)
+    {
+        if (Event.current != null && Event.current.type != EventType.Repaint)
+            return;
+
+        SilCache sc;
+        Mesh mesh;
+        Transform xform;
+        var smr = obj.GetComponentInChildren<SkinnedMeshRenderer>();
+        if (smr != null)
+        {
+            if (!_silCache.TryGetValue(smr, out sc))
+                _silCache[smr] = sc = NewSilCache();
+            smr.BakeMesh(sc.Bake);
+            mesh = sc.Bake;
+            xform = smr.transform;
+        }
+        else
+        {
+            var mf = obj.GetComponentInChildren<MeshFilter>();
+            if (mf == null || mf.sharedMesh == null)
+                return;
+            if (!_silCacheMf.TryGetValue(mf, out sc))
+                _silCacheMf[mf] = sc = NewSilCache();
+            mesh = mf.sharedMesh;
+            xform = mf.transform;
+        }
+
+        var verts = mesh.vertices;
+        int vc = verts.Length;
+        if (vc < 3 || vc > 8000)
+            return;
+
+        if (sc.Weld == null || sc.OrigVc != vc)
+        {
+            int[] tris = CollectTriangles(mesh);
+            if (tris == null || tris.Length < 3)
+                return;
+            BuildSilTopology(sc, verts, tris);
+        }
+        int tc = sc.OrigTc;
+
+        var l2w = xform.localToWorldMatrix;
+        if (sc.World == null || sc.World.Length < sc.WeldCount)
+            sc.World = new Vector3[sc.WeldCount];
+        for (int i = 0; i < vc; i++)
+            sc.World[sc.Weld[i]] = l2w.MultiplyPoint3x4(verts[i]);
+
+        Vector3 camPos = cam.transform.position;
+        if (sc.Front == null || sc.Front.Length < tc)
+            sc.Front = new bool[tc];
+        for (int t = 0; t < tc; t++)
+        {
+            Vector3 a = sc.World[sc.T0[t]];
+            Vector3 b = sc.World[sc.T1[t]];
+            Vector3 c = sc.World[sc.T2[t]];
+            Vector3 n = Vector3.Cross(b - a, c - a);
+            sc.Front[t] = Vector3.Dot(n, camPos - a) > 0f;
+        }
+
+        EnsureLineMat();
+        _lineMat.SetPass(0);
+        GL.PushMatrix();
+        GL.LoadPixelMatrix();
+        int sh = Screen.height;
+        // dark underlay then color — silhouette stays readable over water/sky
+        GL.Begin(GL.LINES);
+        GL.Color(new Color(0f, 0f, 0f, Mathf.Clamp(col.a * 0.45f, 0.18f, 0.4f)));
+        EmitSilhouetteEdges(sc, cam, sh, 1f);
+        GL.End();
+        GL.Begin(GL.LINES);
+        GL.Color(new Color(col.r, col.g, col.b, Mathf.Clamp(col.a * 0.92f, 0.4f, 0.95f)));
+        EmitSilhouetteEdges(sc, cam, sh, 0f);
+        GL.End();
+        GL.PopMatrix();
+
+        if (Time.unscaledTime >= _silPruneAt)
+        {
+            _silPruneAt = Time.unscaledTime + 5f;
+            PruneSilCache();
+        }
+    }
+
+    private static void EmitSilhouetteEdges(SilCache sc, Camera cam, int sh, float pixelOffset)
+    {
+        for (int i = 0; i < sc.EA.Length; i++)
+        {
+            bool f1 = sc.ET1[i] >= 0 && sc.Front[sc.ET1[i]];
+            bool f2 = sc.ET2[i] >= 0 && sc.Front[sc.ET2[i]];
+            if (f1 == f2)
+                continue;
+            Vector3 sa = cam.WorldToScreenPoint(sc.World[sc.EA[i]]);
+            Vector3 sb = cam.WorldToScreenPoint(sc.World[sc.EB[i]]);
+            if (sa.z <= 0.1f || sb.z <= 0.1f)
+                continue;
+            GL.Vertex3(sa.x + pixelOffset, sh - sa.y + pixelOffset, 0);
+            GL.Vertex3(sb.x + pixelOffset, sh - sb.y + pixelOffset, 0);
+        }
+    }
+
+    private static int[] CollectTriangles(Mesh mesh)
+    {
+        if (mesh.subMeshCount <= 1)
+            return mesh.triangles;
+        var all = new List<int>(mesh.triangles);
+        for (int s = 1; s < mesh.subMeshCount; s++)
+            all.AddRange(mesh.GetTriangles(s));
+        return all.ToArray();
+    }
+
+    private static void BuildSilTopology(SilCache sc, Vector3[] verts, int[] tris)
+    {
+        int vc = verts.Length;
+        int tc = tris.Length / 3;
+        sc.OrigVc = vc;
+        sc.OrigTc = tc;
+        sc.Weld = new int[vc];
+        _weldMap.Clear();
+        int wc = 0;
+        for (int i = 0; i < vc; i++)
+        {
+            long k = HashVert(verts[i]);
+            if (!_weldMap.TryGetValue(k, out int w))
+            {
+                w = wc++;
+                _weldMap[k] = w;
+            }
+            sc.Weld[i] = w;
+        }
+        sc.WeldCount = wc;
+        sc.T0 = new int[tc];
+        sc.T1 = new int[tc];
+        sc.T2 = new int[tc];
+
+        var edges = new Dictionary<long, int>(tc * 2);
+        var ea = new List<int>(tc * 2);
+        var eb = new List<int>(tc * 2);
+        var et1 = new List<int>(tc * 2);
+        var et2 = new List<int>(tc * 2);
+
+        void AddEdge(int a, int b, int tri)
+        {
+            if (a == b) return;
+            int lo = a < b ? a : b;
+            int hi = a < b ? b : a;
+            long key = ((long)lo << 32) | (uint)hi;
+            if (edges.TryGetValue(key, out int idx))
+            {
+                if (et2[idx] < 0)
+                    et2[idx] = tri;
+            }
+            else
+            {
+                edges[key] = ea.Count;
+                ea.Add(lo);
+                eb.Add(hi);
+                et1.Add(tri);
+                et2.Add(-1);
+            }
+        }
+
+        for (int t = 0; t < tc; t++)
+        {
+            int i0 = sc.Weld[tris[t * 3]];
+            int i1 = sc.Weld[tris[t * 3 + 1]];
+            int i2 = sc.Weld[tris[t * 3 + 2]];
+            sc.T0[t] = i0;
+            sc.T1[t] = i1;
+            sc.T2[t] = i2;
+            AddEdge(i0, i1, t);
+            AddEdge(i1, i2, t);
+            AddEdge(i2, i0, t);
+        }
+
+        sc.EA = ea.ToArray();
+        sc.EB = eb.ToArray();
+        sc.ET1 = et1.ToArray();
+        sc.ET2 = et2.ToArray();
+    }
+
+    private static long HashVert(Vector3 p)
+    {
+        int x = (int)Mathf.Round(p.x * 1000f) + 500000;
+        int y = (int)Mathf.Round(p.y * 1000f) + 500000;
+        int z = (int)Mathf.Round(p.z * 1000f) + 500000;
+        return ((long)x * 1000003L + y) * 1000033L + z;
+    }
+
+    private static void PruneSilCache()
+    {
+        if (_silCache.Count > 0)
+        {
+            List<SkinnedMeshRenderer> gone = null;
+            foreach (var k in _silCache.Keys)
+                if (k == null) (gone ??= new List<SkinnedMeshRenderer>()).Add(k);
+            if (gone != null)
+                foreach (var k in gone) _silCache.Remove(k);
+        }
+        if (_silCacheMf.Count > 0)
+        {
+            List<MeshFilter> gone = null;
+            foreach (var k in _silCacheMf.Keys)
+                if (k == null) (gone ??= new List<MeshFilter>()).Add(k);
+            if (gone != null)
+                foreach (var k in gone) _silCacheMf.Remove(k);
+        }
+    }
+
+    /// <summary>Top-left watermark: enabled toggles, transparent light-gray text.</summary>
+    private static void DrawActiveHud(CheatController c)
+    {
+        var lines = new List<string>();
+        foreach (var id in FeatureActions.All)
+            if (FeatureActions.Get(id))
+                lines.Add(ActionLabel(id));
+        if (lines.Count == 0)
+            return;
+
+        for (int i = 0; i < lines.Count; i++)
+        {
+            var shadow = new Rect(11, 11 + i * 17, 320, 17);
+            GUI.Label(shadow, $"<color=#000000>{lines[i]}</color>", _labelSmall);
+            var main = new Rect(10, 10 + i * 17, 320, 17);
+            GUI.Label(main, $"<color=#c8cdd0>{lines[i]}</color>", _labelSmall);
+        }
+    }
+
+    /// <summary>Slot machine prediction HUD: shows the captured winning result for 6s.</summary>
+    private static void DrawSlotsHud()
+    {
+        if (!Features.SlotPredict || SlotsPrediction.ResultText == null
+            || Time.unscaledTime > SlotsPrediction.Until)
+            return;
+
+        string text = L.T("老虎机 · ", "老虎機 · ", "Slots · ") + SlotsPrediction.ResultText
+            + "   (" + SlotsPrediction.RollerName + ")";
+        var size = _label.CalcSize(new GUIContent(text));
+        float w = size.x + 36, h = 34;
+        var r = new Rect((Screen.width - w) / 2f, 134, w, h);
+        DrawFill(r, CPanel);
+        DrawFill(new Rect(r.x, r.yMax - 2, r.width, 2), CRouletteGreen);
+        GUI.Label(new Rect(r.x, r.y + 6, r.width, 22), text, _label);
     }
 
     /// <summary>
@@ -148,14 +838,18 @@ public static class MenuUi
         }
 
         float cx = sp.x, cy = sp.y;
+        var cc = EspColor(Features.CrosshairColor);
         var prev = GUI.color;
-        GUI.color = new Color(0.95f, 0.97f, 1f, 0.85f);
-        float dot = 2.5f, gap = 5f, len = 7f, t = 1.6f;
+        GUI.color = cc;
+        float dot = 2.5f, gap = Features.CrosshairGap, len = Features.CrosshairLen, t = 1.6f;
         GUI.DrawTexture(new Rect(cx - dot / 2, cy - dot / 2, dot, dot), Texture2D.whiteTexture);
-        GUI.DrawTexture(new Rect(cx - t / 2, cy - gap - len, t, len), Texture2D.whiteTexture); // up
-        GUI.DrawTexture(new Rect(cx - t / 2, cy + gap, t, len), Texture2D.whiteTexture);       // down
-        GUI.DrawTexture(new Rect(cx - gap - len, cy - t / 2, len, t), Texture2D.whiteTexture); // left
-        GUI.DrawTexture(new Rect(cx + gap, cy - t / 2, len, t), Texture2D.whiteTexture);       // right
+        if (Features.CrosshairStyle == 0)
+        {
+            GUI.DrawTexture(new Rect(cx - t / 2, cy - gap - len, t, len), Texture2D.whiteTexture); // up
+            GUI.DrawTexture(new Rect(cx - t / 2, cy + gap, t, len), Texture2D.whiteTexture);       // down
+            GUI.DrawTexture(new Rect(cx - gap - len, cy - t / 2, len, t), Texture2D.whiteTexture); // left
+            GUI.DrawTexture(new Rect(cx + gap, cy - t / 2, len, t), Texture2D.whiteTexture);       // right
+        }
         GUI.color = prev;
     }
 
@@ -170,26 +864,153 @@ public static class MenuUi
     {
         _bindPopup = actions;
         _bindPopupTitle = BindTitle(actions);
-        bool hasColor = GetActionColor(actions[0]) >= 0;
-        float h = 30 + actions.Length * 30 + (hasColor ? 140 : 0) + 34;
-        _bindPopupRect = new Rect(_win.x + winLocalMouse.x + 8, _win.y + winLocalMouse.y + 8, 230, h);
+        _bindPopupRect = new Rect(_win.x + winLocalMouse.x + 8, _win.y + winLocalMouse.y + 8, 320, 200);
+        // height is corrected inside BindPopupFunc every frame (color section expands)
         _listening = null;
         _pickDrag = 0;
+        _pickerAction = null;
+        _pickerSlot = null;
         _pvSyncColor = -1; // force picker resync to this action's color
+    }
+
+    /// <summary>Extra settings block height for an action (drawn inside its popup).</summary>
+    private static float ActionSettingsHeight(string action)
+    {
+        switch (action)
+        {
+            case "PlayerEsp": return 52;
+            case "CreatureEsp": return 130;
+            case "Crosshair": return 74;
+            case "SilentAim": return 130;
+            case "ItemEsp": return 104;
+            default: return 0;
+        }
+    }
+
+    /// <summary>Draw the extra settings block for an action inside its popup.</summary>
+    private static void DrawActionSettings(string action, float y, float width, out float nextY)
+    {
+        nextY = y;
+        switch (action)
+        {
+            case "PlayerEsp":
+                PopupOptionRow(y, width, L.T("样式", "樣式", "Style"),
+                    new[] { L.T("框线", "框線", "Full"), L.T("四角", "四角", "Corners"), L.T("填充", "填充", "Fill") },
+                    ref Features.PlayerBoxStyle);
+                PopupToggleRow(y + 30, width, L.T("名字标签", "名字標籤", "Name label"), ref Features.PlayerLabel);
+                nextY = y + 52;
+                break;
+            case "CreatureEsp":
+                PopupToggleRow(y, width, L.T("标签", "標籤", "Label"), ref Features.CreatureLabel);
+                PopupToggleRow(y + 26, width, L.T("外框", "外框", "Frame"), ref Features.CreatureFrame);
+                PopupToggleRow(y + 52, width, L.T("填充", "填充", "Fill"), ref Features.CreatureFill);
+                PopupToggleRow(y + 78, width, L.T("轮廓", "輪廓", "Outline"), ref Features.CreatureSilhouette);
+                PopupSliderRow(y + 104, width, L.T("显示距离", "顯示距離", "Distance"), ref Features.CreatureEspDist, 30f, 250f);
+                nextY = y + 130;
+                break;
+            case "Crosshair":
+                PopupOptionRow(y, width, L.T("样式", "樣式", "Style"),
+                    new[] { L.T("十字", "十字", "Cross"), L.T("单点", "單點", "Dot") },
+                    ref Features.CrosshairStyle);
+                PopupSliderRow(y + 30, width, L.T("长度", "長度", "Length"), ref Features.CrosshairLen, 3f, 14f);
+                PopupSliderRow(y + 52, width, L.T("间隙", "間隙", "Gap"), ref Features.CrosshairGap, 0f, 14f);
+                nextY = y + 74;
+                break;
+            case "ItemEsp":
+                PopupToggleRow(y, width, L.T("仅标签", "僅標籤", "Label"), ref Features.ItemLabel);
+                PopupToggleRow(y + 26, width, L.T("外框", "外框", "Frame"), ref Features.ItemFrame);
+                PopupToggleRow(y + 52, width, L.T("填充", "填充", "Fill"), ref Features.ItemFill);
+                PopupSliderRow(y + 78, width, L.T("显示距离", "顯示距離", "Distance"), ref Features.ItemEspDist, 20f, 250f);
+                Features.ItemEspStyle = Features.ItemFrame ? 1 : 0;
+                nextY = y + 104;
+                break;
+            case "SilentAim":
+                PopupToggleRow(y, width, L.T("玩家", "玩家", "Players"), ref Features.SilentAimPlayers);
+                PopupToggleRow(y + 26, width, L.T("生物", "生物", "Creatures"), ref Features.SilentAimCreatures);
+                PopupOptionRow(y + 52, width, L.T("优先", "優先", "Priority"),
+                    new[]
+                    {
+                        L.T("准星", "準星", "Crosshair"),
+                        L.T("距离", "距離", "Distance"),
+                        L.T("血量", "血量", "HP"),
+                    },
+                    ref Features.SilentAimPriority);
+                PopupToggleRow(y + 78, width, L.T("移动预判", "移動預判", "Prediction"), ref Features.SilentAimPredict);
+                PopupSliderRow(y + 104, width, L.T("搜索锥角", "搜索錐角", "Cone"), ref Features.SilentAimAngle, 10f, 180f);
+                Features.SilentAimTarget = Features.SilentAimPlayers
+                    ? (Features.SilentAimCreatures ? 2 : 0)
+                    : 1;
+                nextY = y + 130;
+                break;
+        }
+    }
+
+    /// <summary>Mini toggle row for popups.</summary>
+    private static void PopupToggleRow(float y, float width, string label, ref bool value)
+    {
+        GUI.Label(new Rect(10, y + 4, width - 70, 18), label, _label);
+        var pill = new Rect(width - 58, y + 2, 44, 22);
+        if (GUI.Button(pill, "", value ? _pillOn : _pillOff))
+        {
+            value = !value;
+            Settings.MarkDirty();
+        }
+        DrawKnob(pill, value, true);
+    }
+
+    /// <summary>Mini segmented option picker for popups (returns true when changed).</summary>
+    private static void PopupOptionRow(float y, float width, string label, string[] options, ref int index)
+    {
+        GUI.Label(new Rect(10, y + 4, 60, 18), label, _label);
+        float bw = (width - 70 - 6 * options.Length) / options.Length + 6;
+        for (int i = 0; i < options.Length; i++)
+        {
+            var br = new Rect(width - 10 - (options.Length - i) * (bw + 3), y + 2, bw, 22);
+            if (GUI.Button(br, options[i], index == i ? _btnAccent : _btn) && index != i)
+            {
+                index = i;
+                Settings.MarkDirty();
+            }
+        }
+    }
+
+    /// <summary>Mini label+slider row for popups.</summary>
+    private static void PopupSliderRow(float y, float width, string label, ref float value, float min, float max)
+    {
+        GUI.Label(new Rect(10, y + 3, 60, 18), label, _label);
+        var bar = new Rect(74, y + 5, width - 74 - 44, 14);
+        float nv = GUI.HorizontalSlider(bar, value, min, max, _sliderBg, _sliderThumb);
+        nv = Mathf.Round(nv * 10f) / 10f;
+        if (!Mathf.Approximately(nv, value))
+            Settings.MarkDirty();
+        value = nv;
+        GUI.Label(new Rect(width - 44, y + 3, 40, 18), $"{value:0.#}", _value);
     }
 
     /// <summary>Actions that own an ESP color (packed 0xRRGGBB); -1 = none.</summary>
     private static int GetActionColor(string action)
     {
-        if (action == "PlayerEsp") return Features.EspBoxColor;
-        if (action == "PlayerSkeleton") return Features.EspSkeletonColor;
-        return -1;
+        switch (action)
+        {
+            case "PlayerEsp": return Features.EspBoxColor;
+            case "PlayerSkeleton": return Features.EspSkeletonColor;
+            case "CreatureEsp": return Features.EspCreatureColor;
+            case "ItemEsp": return Features.EspItemColor;
+            case "Crosshair": return Features.CrosshairColor;
+            default: return -1;
+        }
     }
 
     private static void SetActionColor(string action, int rgb)
     {
-        if (action == "PlayerEsp") Features.EspBoxColor = rgb;
-        else if (action == "PlayerSkeleton") Features.EspSkeletonColor = rgb;
+        switch (action)
+        {
+            case "PlayerEsp": Features.EspBoxColor = rgb; break;
+            case "PlayerSkeleton": Features.EspSkeletonColor = rgb; break;
+            case "CreatureEsp": Features.EspCreatureColor = rgb; break;
+            case "ItemEsp": Features.EspItemColor = rgb; break;
+            case "Crosshair": Features.CrosshairColor = rgb; break;
+        }
         Settings.MarkDirty();
     }
 
@@ -204,9 +1025,25 @@ public static class MenuUi
             return;
         if (_bindPopupFn == null)
             _bindPopupFn = id => BindPopupFunc(id);
-        _bindPopupRect = GUI.Window(0x485447, _bindPopupRect, _bindPopupFn, "", _panel);
+
+        // precompute the full content height (the color section may be expanded)
+        var slots = ColorSlots(_bindPopup[0]);
+        bool hasColor = slots.Length > 0;
+        bool expanded = _pickerSlot != null && _pickerAction == _bindPopup[0];
+        float contentH = 28 + 14 + _bindPopup.Length * 30
+            + (ActionSettingsHeight(_bindPopup[0]) > 0 ? 14 + ActionSettingsHeight(_bindPopup[0]) : 0)
+            + (hasColor ? 14 + slots.Length * 22 + (expanded ? 132 : 0) : 0)
+            + 30;
+        _bindPopupRect.height = contentH;
+
+        // keep the whole popup on screen
         _bindPopupRect.x = Mathf.Clamp(_bindPopupRect.x, 4, Screen.width - _bindPopupRect.width - 4);
         _bindPopupRect.y = Mathf.Clamp(_bindPopupRect.y, 4, Screen.height - _bindPopupRect.height - 4);
+
+        // regular window + forced front — ModalWindow would swallow outside clicks,
+        // which is exactly how the popup is supposed to close
+        _bindPopupRect = GUI.Window(0x485447, _bindPopupRect, _bindPopupFn, "", _panel);
+        GUI.BringWindowToFront(0x485447);
     }
 
     private static void BindPopupFunc(int id)
@@ -216,6 +1053,9 @@ public static class MenuUi
 
         GUI.Label(new Rect(10, 5, w.width - 20, 20), _bindPopupTitle, _title);
         float y = 28;
+
+        GUI.Label(new Rect(10, y, w.width - 20, 12), L.T("绑定", "綁定", "BIND"), _hint);
+        y += 14;
         foreach (var a in _bindPopup)
         {
             GUI.Label(new Rect(10, y + 5, 96, 20), ActionLabel(a), _label);
@@ -233,6 +1073,55 @@ public static class MenuUi
             y += 30;
         }
 
+        // per-feature settings (style, sizes, filters) — right inside the popup
+        float setH = ActionSettingsHeight(_bindPopup[0]);
+        if (setH > 0)
+        {
+            GUI.Label(new Rect(10, y, w.width - 20, 12), L.T("设置", "設定", "SETTINGS"), _hint);
+            y += 14;
+        }
+        DrawActionSettings(_bindPopup[0], y, w.width - 20, out float setEnd);
+        y = setEnd;
+
+        // colors: one swatch per slot, click to expand the HSV picker for that slot
+        var slots = ColorSlots(_bindPopup[0]);
+        if (slots.Length > 0)
+        {
+            GUI.Label(new Rect(10, y, w.width - 20, 12), L.T("颜色", "顏色", "COLOR"), _hint);
+            y += 14;
+            foreach (var (slotLabel, slotId) in slots)
+            {
+                int packed = GetSlotColor(_bindPopup[0], slotId);
+                var cCol = EspColor(packed);
+                GUI.Label(new Rect(10, y + 4, w.width - 110, 18), slotLabel, _label);
+                var sw = new Rect(w.width - 92, y + 2, 60, 18);
+                var prevC = GUI.color;
+                GUI.color = cCol;
+                GUI.DrawTexture(sw, Texture2D.whiteTexture);
+                GUI.color = prevC;
+                DrawEspOutline(sw, new Color(1f, 1f, 1f, 0.7f), 1f);
+                if (Event.current.type == EventType.MouseDown && sw.Contains(Event.current.mousePosition))
+                {
+                    // toggle: clicking the expanded slot collapses its picker
+                    if (_pickerSlot == slotId && _pickerAction == _bindPopup[0])
+                    {
+                        _pickerSlot = null;
+                        _pickerAction = null;
+                    }
+                    else
+                    {
+                        _pickerSlot = slotId;
+                        _pickerAction = _bindPopup[0];
+                    }
+                    _pvSyncColor = -1;
+                    Event.current.Use();
+                }
+                y += 22;
+            }
+            if (_pickerSlot != null && _pickerAction == _bindPopup[0])
+                DrawColorPicker(_bindPopup[0], _pickerSlot, y, w.width - 20);
+        }
+
         // clear all binds shown in this popup
         if (GUI.Button(new Rect(10, y + 1, 92, 22), L.T("清除绑定", "清除綁定", "Clear binds"), _btn))
         {
@@ -241,12 +1130,63 @@ public static class MenuUi
             _listening = null;
         }
 
-        // HSV color picker for color-capable actions (presets + SV square + hue bar)
-        if (GetActionColor(_bindPopup[0]) >= 0)
-            DrawColorPicker(_bindPopup[0], y + 30, w.width - 20);
-
         GUI.Label(new Rect(110, y + 5, w.width - 120, 18),
             L.T("点击按钮后按新键 · Esc 取消", "點擊按鈕後按新鍵 · Esc 取消", "Click a button, press the new key · Esc cancels"), _hint);
+
+        // dynamic popup height — the color section expands/collapses at runtime
+        _bindPopupRect.height = y + 34;
+    }
+
+    /// <summary>Color slots (label + id) for an action — each gets its own swatch.</summary>
+    private static (string label, string slot)[] ColorSlots(string action)
+    {
+        switch (action)
+        {
+            case "PlayerEsp":
+                return new[]
+                {
+                    (L.T("框颜色", "框顏色", "Box color"), "box"),
+                    (L.T("填充颜色", "填充顏色", "Fill color"), "fill"),
+                };
+            case "PlayerSkeleton":
+                return new[] { (L.T("骨骼颜色", "骨骼顏色", "Skeleton color"), "main") };
+            case "CreatureEsp":
+                return new[]
+                {
+                    (L.T("生物颜色", "生物顏色", "Creature color"), "box"),
+                    (L.T("生物填充", "生物填充", "Creature fill"), "cfill"),
+                };
+            case "ItemEsp":
+                return new[]
+                {
+                    (L.T("物品颜色", "物品顏色", "Item color"), "ibox"),
+                    (L.T("物品填充", "物品填充", "Item fill"), "ifill"),
+                };
+            case "Crosshair":
+                return new[] { (L.T("准星颜色", "準星顏色", "Crosshair color"), "cross") };
+            default:
+                return Array.Empty<(string, string)>();
+        }
+    }
+
+    private static int GetSlotColor(string action, string slot)
+    {
+        if (action == "PlayerEsp") return slot == "fill" ? Features.EspFillColor : Features.EspBoxColor;
+        if (action == "PlayerSkeleton") return Features.EspSkeletonColor;
+        if (action == "CreatureEsp") return slot == "cfill" ? Features.EspCreatureFillColor : Features.EspCreatureColor;
+        if (action == "ItemEsp") return slot == "ifill" ? Features.EspItemFillColor : Features.EspItemColor;
+        if (action == "Crosshair") return Features.CrosshairColor;
+        return -1;
+    }
+
+    private static void SetSlotColor(string action, string slot, int rgb)
+    {
+        if (action == "PlayerEsp") { if (slot == "fill") Features.EspFillColor = rgb; else Features.EspBoxColor = rgb; }
+        else if (action == "PlayerSkeleton") Features.EspSkeletonColor = rgb;
+        else if (action == "CreatureEsp") { if (slot == "cfill") Features.EspCreatureFillColor = rgb; else Features.EspCreatureColor = rgb; }
+        else if (action == "ItemEsp") { if (slot == "ifill") Features.EspItemFillColor = rgb; else Features.EspItemColor = rgb; }
+        else if (action == "Crosshair") Features.CrosshairColor = rgb;
+        Settings.MarkDirty();
     }
 
     // ────────────────── HSV color picker ──────────────────
@@ -283,23 +1223,23 @@ public static class MenuUi
         _pickerH = _pvH;
         for (int y = 0; y < 64; y++)
             for (int x = 0; x < 64; x++)
-                _svTex.SetPixel(x, y, Color.HSVToRGB(_pvH, x / 63f, 1f - y / 63f));
+                _svTex.SetPixel(x, y, Color.HSVToRGB(_pvH, x / 63f, y / 63f)); // top row = bright (v=1)
         _svTex.Apply();
     }
 
-    private static void ApplyPicker(string act)
+    private static void ApplyPicker(string act, string slot)
     {
         var c = Color.HSVToRGB(_pvH, _pvS, _pvV);
         int packed = (Mathf.RoundToInt(Mathf.Clamp01(c.r) * 255) << 16)
                    | (Mathf.RoundToInt(Mathf.Clamp01(c.g) * 255) << 8)
                    | Mathf.RoundToInt(Mathf.Clamp01(c.b) * 255);
-        SetActionColor(act, packed);
+        SetSlotColor(act, slot, packed);
         _pvSyncColor = packed;
     }
 
-    private static void DrawColorPicker(string act, float y, float width)
+    private static void DrawColorPicker(string act, string slot, float y, float width)
     {
-        int packed = GetActionColor(act);
+        int packed = GetSlotColor(act, slot);
         if (packed != _pvSyncColor)
         {
             var c = EspColor(packed);
@@ -322,7 +1262,7 @@ public static class MenuUi
             GUI.color = prev;
             if (Event.current.type == EventType.MouseDown && sr.Contains(Event.current.mousePosition))
             {
-                SetActionColor(act, Palette[i]);
+                SetSlotColor(act, slot, Palette[i]);
                 Event.current.Use();
             }
         }
@@ -357,13 +1297,13 @@ public static class MenuUi
         if (_pickDrag == 2)
         {
             _pvS = Mathf.Clamp01((e.mousePosition.x - svRect.x) / svRect.width);
-            _pvV = Mathf.Clamp01(1f - (e.mousePosition.y - svRect.y) / svRect.height);
-            ApplyPicker(act);
+                _pvV = Mathf.Clamp01(1f - (e.mousePosition.y - svRect.y) / svRect.height);
+                ApplyPicker(act, slot);
         }
         else if (_pickDrag == 1)
         {
-            _pvH = Mathf.Clamp01((e.mousePosition.x - hueRect.x) / hueRect.width);
-            ApplyPicker(act);
+                _pvH = Mathf.Clamp01((e.mousePosition.x - hueRect.x) / hueRect.width);
+                ApplyPicker(act, slot);
         }
 
         // position indicators
@@ -556,7 +1496,7 @@ public static class MenuUi
         0xF24C4C, // red
         0x4CE65E, // green
         0x5C8DF2, // blue
-        0x3DE0D1, // teal
+        0xE0B85C, // gold
         0xF2994C, // orange
         0xCC73F2, // purple
         0xF2DB4C, // yellow
@@ -566,6 +1506,21 @@ public static class MenuUi
     private static Color EspColor(int rgb)
     {
         return new Color(((rgb >> 16) & 255) / 255f, ((rgb >> 8) & 255) / 255f, (rgb & 255) / 255f, 0.9f);
+    }
+
+    private static GUIStyle _espLabel;
+    private static int _espLabelBuilt = -1;
+
+    /// <summary>Shared ESP label style, rebuilt when the label size setting changes.</summary>
+    private static GUIStyle EspLabel()
+    {
+        if (_espLabel == null || _espLabelBuilt != Features.LabelSize)
+        {
+            _espLabel = Style(null, CText, Mathf.Clamp(Features.LabelSize, 9, 24), rich: true);
+            _espLabel.alignment = TextAnchor.MiddleCenter;
+            _espLabelBuilt = Features.LabelSize;
+        }
+        return _espLabel;
     }
 
     private static void DrawPlayerEsp()
@@ -585,36 +1540,40 @@ public static class MenuUi
             {
                 if (!Combat.GetPlayerBounds(pl, out var b))
                     continue;
-
-                Vector3 head = new Vector3(b.center.x, b.max.y + 0.05f, b.center.z);
-                Vector3 feet = new Vector3(b.center.x, b.min.y, b.center.z);
-                Vector3 sh = cam.WorldToScreenPoint(head);
-                Vector3 sf = cam.WorldToScreenPoint(feet);
-                if (sh.z <= 0.1f || sf.z <= 0.1f)
-                    continue; // behind the camera
-                if (sh.z > 250f)
+                if (!ProjectBounds(b, cam, out var r, out float dist))
                     continue;
-
-                float top = Screen.height - sh.y;
-                float bottom = Screen.height - sf.y;
-                float h = Mathf.Clamp(bottom - top, 18f, Screen.height);
-                float w = Mathf.Clamp(h * 0.45f, 10f, 220f);
-                var r = new Rect(sh.x - w / 2f, top, w, h);
+                if (dist > 250f)
+                    continue;
 
                 if (Features.PlayerSkeleton)
                     DrawSkeleton(pl, cam);
 
                 if (Features.PlayerEsp)
                 {
-                    DrawEspOutline(r, EspColor(Features.EspBoxColor));
+                    var bc = EspColor(Features.EspBoxColor);
+                    bc.a = Mathf.Clamp01(Features.EspBoxAlpha);
+                    if (Features.PlayerBoxStyle == 2)
+                    {
+                        var fc = EspColor(Features.EspFillColor);
+                        fc.a = Mathf.Clamp01(Features.EspFillAlpha);
+                        DrawEspFilled(r, bc, fc, Features.EspOutlineWidth);
+                    }
+                    else
+                        DrawEspFrame(r, bc, Features.PlayerBoxStyle == 1);
 
-                    string name = (pl.SteamName ?? L.T("玩家", "玩家", "Player")).Replace("<", "");
-                    GUI.Label(new Rect(r.x - 40, r.y - 20, r.width + 80, 18),
-                        $"<color=#{ColorUtility.ToHtmlStringRGB(EspColor(Features.EspBoxColor))}>{name}  {sh.z:0}m</color>", _label);
+                    if (Features.PlayerLabel)
+                    {
+                        string name = (pl.SteamName ?? L.T("玩家", "玩家", "Player")).Replace("<", "");
+                        DrawEspNameplate(r, name, dist, bc, 1f);
+                    }
                 }
 
                 if (Features.PlayerHealth)
-                    DrawHealthBar(r, GetHealth(pl));
+                {
+                    float hpOff = (Features.PlayerEsp && Features.PlayerLabel)
+                        ? Mathf.Clamp(Features.LabelSize, 9, 24) + 6f : 0f;
+                    DrawHealthBar(new Rect(r.x, r.y - hpOff, r.width, r.height), GetHealth(pl));
+                }
             }
             catch { /* player just left, ignore */ }
         }
@@ -687,18 +1646,21 @@ public static class MenuUi
 
     private static Material _lineMat;
 
+    private static void EnsureLineMat()
+    {
+        if (_lineMat != null)
+            return;
+        _lineMat = new Material(Shader.Find("Hidden/Internal-Colored"));
+        _lineMat.hideFlags = HideFlags.HideAndDontSave;
+        _lineMat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+        _lineMat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+        _lineMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
+        _lineMat.SetInt("_ZWrite", 0);
+    }
     /// <summary>1px GL line in GUI pixel space (IMGUI has no line primitive).</summary>
     private static void DrawLine(Vector2 a, Vector2 b, Color c)
     {
-        if (_lineMat == null)
-        {
-            _lineMat = new Material(Shader.Find("Hidden/Internal-Colored"));
-            _lineMat.hideFlags = HideFlags.HideAndDontSave;
-            _lineMat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-            _lineMat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-            _lineMat.SetInt("_Cull", (int)UnityEngine.Rendering.CullMode.Off);
-            _lineMat.SetInt("_ZWrite", 0);
-        }
+        EnsureLineMat();
         _lineMat.SetPass(0);
         GL.PushMatrix();
         GL.LoadPixelMatrix();
@@ -710,16 +1672,64 @@ public static class MenuUi
         GL.PopMatrix();
     }
 
-    private static void DrawEspOutline(Rect r, Color color)
+    private static void DrawEspOutline(Rect r, Color color, float width = 1f)
     {
         var prev = GUI.color;
         GUI.color = color;
-        const float t = 1.5f;
+        float t = Mathf.Clamp(width, 1f, 2f);
         GUI.DrawTexture(new Rect(r.x, r.y, r.width, t), Texture2D.whiteTexture);
         GUI.DrawTexture(new Rect(r.x, r.yMax - t, r.width, t), Texture2D.whiteTexture);
         GUI.DrawTexture(new Rect(r.x, r.y, t, r.height), Texture2D.whiteTexture);
         GUI.DrawTexture(new Rect(r.xMax - t, r.y, t, r.height), Texture2D.whiteTexture);
         GUI.color = prev;
+    }
+
+    /// <summary>
+    /// Soft AABB fill. Near / large boxes fade so they don't paint over the model;
+    /// tiny far boxes stay a touch more visible.
+    /// </summary>
+    private static void DrawEspSoftFill(Rect r, Color fill)
+    {
+        float area = r.width * r.height;
+        float cover = area / Mathf.Max(1f, Screen.width * (float)Screen.height);
+        float fa = Mathf.Clamp(fill.a, 0f, 0.18f) * Mathf.Clamp01(1.08f - cover * 18f);
+        if (fa < 0.012f)
+            return;
+        var prev = GUI.color;
+        GUI.color = new Color(fill.r, fill.g, fill.b, fa);
+        GUI.DrawTexture(r, Texture2D.whiteTexture);
+        GUI.color = prev;
+    }
+
+    /// <summary>Translucent fill + outline. Fill alpha is respected and capped so it stays quiet.</summary>
+    private static void DrawEspFilled(Rect r, Color outline, Color fill, float width = 1f)
+    {
+        DrawEspSoftFill(r, fill);
+        DrawEspOutline(r, outline, width);
+    }
+
+    /// <summary>Corner-only box — stays readable on large close objects without covering them.</summary>
+    private static void DrawEspCorners(Rect r, Color color)
+    {
+        var prev = GUI.color;
+        GUI.color = color;
+        float t = 1.2f;
+        float len = Mathf.Clamp(Mathf.Min(r.width, r.height) * 0.28f, 5f, 16f);
+        len4(r, t, len);
+        GUI.color = prev;
+    }
+
+    private static void len4(Rect r, float t, float len)
+    {
+        // 4 corners, 8 segments
+        GUI.DrawTexture(new Rect(r.x, r.y, len, t), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(r.x, r.y, t, len), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(r.xMax - len, r.y, len, t), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(r.xMax - t, r.y, t, len), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(r.x, r.yMax - t, len, t), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(r.x, r.yMax - len, t, len), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(r.xMax - len, r.yMax - t, len, t), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(r.xMax - t, r.yMax - len, t, len), Texture2D.whiteTexture);
     }
 
     // ────────────────────────── roulette prediction HUD ──────────────────────────
@@ -805,35 +1815,31 @@ public static class MenuUi
 
         y += 30;
 
-        // tab bar
-        var tabs = Tabs;
-        float tabW = (w.width - 28) / tabs.Length;
-        for (int i = 0; i < tabs.Length; i++)
+        // content: left nav sidebar + right page area (scrollable)
+        float bodyY = y + 8;
+        float bodyH = w.height - bodyY - 26;
+        var navRect = new Rect(x, bodyY, NavW, bodyH);
+        float pageX = x + NavW + NavGap;
+        var pageRect = new Rect(pageX, bodyY, w.width - pageX - 14, bodyH);
+
+        var pages = Pages;
+        for (int i = 0; i < pages.Count; i++)
         {
-            var r = new Rect(x + i * tabW, y, tabW, 26);
-            bool on = _tab == i;
-            if (GUI.Button(r, tabs[i], on ? _tabOn : _tabOff))
-                _tab = i;
+            var nr = new Rect(navRect.x, navRect.y + i * 32, navRect.width, 28);
+            bool on = _page == i;
             if (on)
-                DrawFill(new Rect(r.x + 10, r.yMax, r.width - 20, 2), CAccent);
+                DrawFill(nr, CAccentDim);
+            if (GUI.Button(nr, pages[i].Label, on ? _tabOn : _tabOff) && _page != i)
+            {
+                _page = i;
+                _bindPopup = null; // switching pages closes the settings popup
+                _listening = null;
+            }
         }
 
-        y += 34;
-
-        // content (scrollable — tabs may exceed the window height)
-        var content = new Rect(0, y, w.width, w.height - y - 26);
-        GUILayout.BeginArea(content);
+        GUILayout.BeginArea(pageRect);
         _tabScroll = GUILayout.BeginScrollView(_tabScroll, GUILayout.ExpandHeight(true), GUILayout.ExpandWidth(true));
-        switch (_tab)
-        {
-            case 0: TabPlayer(c); break;
-            case 1: TabMoney(c); break;
-            case 2: TabItems(c); break;
-            case 3: TabCombat(c); break;
-            case 4: TabBoat(c); break;
-            case 5: TabFun(c); break;
-            case 6: TabKeys(c); break;
-        }
+        pages[_page].Draw(c);
         GUILayout.EndScrollView();
         GUILayout.EndArea();
 
@@ -841,14 +1847,14 @@ public static class MenuUi
         string hint = Features.IsHost
             ? L.T("INSERT 开关菜单 · 你是主机,全部功能可用",
                   "INSERT 開關選單 · 你是主機,全部功能可用",
-                  "INSERT toggles the menu · You are the host, everything works")
+                  "INSERT — menu · Host: everything works")
             : Multiplayer.HostModOnline
                 ? L.T("INSERT 开关菜单 · 联机桥已连接,全功能可用",
                       "INSERT 開關選單 · 聯機橋已連線,全功能可用",
-                      "INSERT toggles the menu · Bridge connected, full features")
+                      "INSERT — menu · Host mod connected: everything works")
                 : L.T("INSERT 开关菜单 · 房主未装mod:战斗页本地功能可用,其余置灰",
                       "INSERT 開關選單 · 房主未裝mod:戰鬥頁本地功能可用,其餘置灰",
-                      "INSERT toggles the menu · Host has no mod: local combat features only");
+                      "INSERT — menu · Host has no mod: combat page only");
         GUI.Label(new Rect(14, w.height - 24, w.width - 128, 18), hint, _hint);
 
         string langKey = L.SettingKey(L.Setting);
@@ -912,36 +1918,80 @@ public static class MenuUi
     private static void TabPlayer(CheatController c)
     {
         BeginSection(L.T("生存", "生存", "Survival"));
-        ToggleRow(L.T("上帝模式", "上帝模式", "God Mode"),
-            L.T("免疫所有伤害(火/毒/溺水/攻击)", "免疫所有傷害(火/毒/溺水/攻擊)", "Immune to all damage (fire/poison/drowning/attacks)"),
+        ToggleRow(L.T("上帝模式", "上帝模式", "God mode"),
+            L.T("免疫所有伤害(火/毒/溺水/攻击)", "免疫所有傷害(火/毒/溺水/攻擊)", "Immune to fire, poison, drowning and hits"),
             Features.GodMode, true, v => FeatureActions.Apply("GodMode", v),
             new[] { "GodMode" });
-        ToggleRow(L.T("锁满饱食度", "鎖滿飽食度", "Fullness Lock"),
-            L.T("不掉饱食 / 中毒 / 着火", "不掉飽食 / 中毒 / 著火", "No hunger, poison or fire"),
+        ToggleRow(L.T("锁满饱食度", "鎖滿飽食度", "No hunger"),
+            L.T("不掉饱食 / 中毒 / 着火", "不掉飽食 / 中毒 / 著火", "Hunger, poison and fire stay frozen"),
             Features.FullnessLock, Features.CanHostAct, v => FeatureActions.Apply("FullnessLock", v),
             new[] { "FullnessLock" });
-        ToggleRow(L.T("保留物品栏", "保留物品欄", "Keep Inventory"),
-            L.T("死亡/复活不掉落物品", "死亡/復活不掉落物品", "No item drops on death/respawn"),
+        ToggleRow(L.T("保留物品栏", "保留物品欄", "Keep inventory"),
+            L.T("死亡/复活不掉落物品", "死亡/復活不掉落物品", "Nothing drops when you die"),
             Features.KeepInventory, true, v => FeatureActions.Apply("KeepInventory", v),
             new[] { "KeepInventory" });
         EndSection();
 
         BeginSection(L.T("运动", "運動", "Movement"));
-        ToggleRow(L.T("玩家飞行", "玩家飛行", "Player Flight"),
-            L.T("Space 升 / Ctrl 降,悬停;开船时自动让位", "Space 升 / Ctrl 降,懸停;開船時自動讓位", "Space up / Ctrl down, hover; yields while driving"),
+        ToggleRow(L.T("玩家飞行", "玩家飛行", "Flight"),
+            L.T("Space 升 / Ctrl 降,悬停;开船时自动让位", "Space 升 / Ctrl 降,懸停;開船時自動讓位", "Space up / Ctrl down, hover. Pauses while driving"),
             Features.PlayerFlight, true, v => FeatureActions.Apply("PlayerFlight", v),
             new[] { "PlayerFlight", Hotkeys.PlayerFlightUp, Hotkeys.PlayerFlightDown });
-        SliderRow(L.T("移速倍率", "移速倍率", "Speed"), ref Features.SpeedMult, 0.3f, 5f, "x");
-        SliderRow(L.T("跳跃倍率", "跳躍倍率", "Jump"), ref Features.JumpMult, 0.3f, 5f, "x");
+        SliderRow(L.T("移速倍率", "移速倍率", "Move speed"), ref Features.SpeedMult, 0.3f, 5f, "x");
+        SliderRow(L.T("跳跃倍率", "跳躍倍率", "Jump height"), ref Features.JumpMult, 0.3f, 5f, "x");
         EndSection();
 
-        BeginSection(L.T("视觉", "視覺", "Visual"));
-        ToggleRow(L.T("第三人称", "第三人稱", "Third Person"),
-            L.T("相机拉到角色身后跟随视角", "相機拉到角色身後跟隨視角", "Camera follows behind your character"),
+        BeginSection(L.T("视角", "視角", "Camera"));
+        ToggleRow(L.T("第三人称", "第三人稱", "Third person"),
+            L.T("相机拉到角色身后跟随视角", "相機拉到角色身後跟隨視角", "See your own character (clones a friend's body)"),
             Features.ThirdPerson, true, v => FeatureActions.Apply("ThirdPerson", v),
             new[] { "ThirdPerson" });
-        SliderRow(L.T("第三人称距离", "第三人稱距離", "TP Distance"), ref Features.ThirdPersonDist, 0.5f, 8f, "m");
+        SliderRow(L.T("第三人称距离", "第三人稱距離", "Camera distance"), ref Features.ThirdPersonDist, 0.5f, 8f, "m");
         SliderRow(L.T("FOV 倍率", "FOV 倍率", "FOV"), ref Features.FovMult, 0.5f, 2f, "x");
+        EndSection();
+
+        BeginSection(L.T("传送到岛屿", "傳送到島嶼", "Islands"));
+        int n = Features.RealIslandCount();
+        const float bs = 34f, gap = 5f, per = 6f;
+        int rows = Mathf.CeilToInt(n / per);
+        var grid = GUILayoutUtility.GetRect(0, rows * (bs + 4), GUILayout.ExpandWidth(true));
+        float cell = (grid.width - (per - 1) * gap) / per;
+        for (int i = 0; i < n; i++)
+        {
+            int row = i / (int)per, col = i % (int)per;
+            var br = new Rect(grid.x + col * (cell + gap), grid.y + row * (bs + 4), cell, bs);
+            int island = i + 1;
+            if (GUI.Button(br, island.ToString(), _btn))
+            {
+                if (Features.TeleportToIsland(island))
+                    c.ShowToast(L.T("全员传送至 ", "全員傳送至 ", "Everyone warped to island ") + island);
+                else
+                    c.ShowToast(L.T("需要主机", "需要主機", "Host required"));
+            }
+        }
+        Hint(L.T("走游戏原生换岛流程,会带上所有玩家(需主机)。", "走遊戲原生換島流程,會帶上所有玩家(需主機)。", "Uses the game's island swap — brings everyone (host only)."));
+        EndSection();
+
+        BeginSection(L.T("传送到玩家", "傳送到玩家", "Teleport to player"));
+        bool anyTp = false;
+        if (Player.LocalPlayer != null)
+        {
+            foreach (var pl in PlayerManager.AlivePlayers)
+            {
+                if (pl == null || pl == Player.LocalPlayer)
+                    continue;
+                anyTp = true;
+                string nm = (pl.SteamName ?? L.T("玩家", "玩家", "Player")).Replace("<", "");
+                var captured = pl;
+                ButtonRow("→ " + nm, null, true, () =>
+                {
+                    if (Features.TeleportToPlayer(captured))
+                        c.ShowToast(L.T("已传送到 ", "已傳送到 ", "Teleported to ") + nm);
+                }, null);
+            }
+        }
+        if (!anyTp)
+            Hint(L.T("附近没有其他玩家。", "附近沒有其他玩家。", "No other players around."));
         EndSection();
     }
 
@@ -971,12 +2021,8 @@ public static class MenuUi
         EndSection();
 
         BeginSection(L.T("开关", "開關", "Toggles"));
-        ToggleRow(L.T("秒杀", "秒殺", "One Shot"),
-            L.T("自己打出的伤害固定为 100000", "自己打出的傷害固定為 100000", "Your attacks deal a fixed 100000 damage"),
-            Features.SelfOneShot, true, v => FeatureActions.Apply("SelfOneShot", v),
-            new[] { "SelfOneShot" });
-        ToggleRow(L.T("游戏内置作弊", "遊戲內置作弊", "Built-in Cheats"),
-            L.T("启用后 M=+$99999 / N=-$99999 / Ctrl+M=+€999", "啟用後 M=+$99999 / N=-$99999 / Ctrl+M=+€999", "Enables M=+$99999 / N=-$99999 / Ctrl+M=+€999"),
+        ToggleRow(L.T("游戏内置作弊", "遊戲內置作弊", "Game cheats (M/N)"),
+            L.T("启用后 M=+$99999 / N=-$99999 / Ctrl+M=+€999", "啟用後 M=+$99999 / N=-$99999 / Ctrl+M=+€999", "The game's built-in money keys"),
             Features.BuiltInCheats, Features.CanHostAct, v =>
         {
             if (Features.HostAct(CheatAction.BuiltInCheats, flag: v))
@@ -990,6 +2036,62 @@ public static class MenuUi
         EndSection();
     }
 
+    // ────────────────────────── tab: visual ──────────────────────────
+
+    private static void TabVisual(CheatController c)
+    {
+        BeginSection(L.T("标签", "標籤", "Labels"));
+        float lblSize = Features.LabelSize;
+        SliderRow(L.T("标签大小", "標籤大小", "Label size"), ref lblSize, 10f, 20f, "px");
+        int nv = Mathf.RoundToInt(lblSize);
+        if (nv != Features.LabelSize)
+        {
+            Features.LabelSize = nv;
+            Settings.MarkDirty();
+        }
+        EndSection();
+
+        BeginSection(L.T("玩家", "玩家", "Players"));
+        ToggleRow(L.T("玩家透视", "玩家透視", "Player boxes"),
+            L.T("隔墙显示其他玩家的框与名字(右键改色/样式)", "隔牆顯示其他玩家的框與名字(右鍵改色/樣式)", "Boxes + names through walls (right-click: color & style)"),
+            Features.PlayerEsp, true, v => FeatureActions.Apply("PlayerEsp", v),
+            new[] { "PlayerEsp" });
+        ToggleRow(L.T("玩家骨骼", "玩家骨骼", "Skeleton"),
+            L.T("隔墙显示骨架线条(右键行改色)", "隔牆顯示骨架線條(右鍵行改色)", "Bone lines through walls (right-click for color)"),
+            Features.PlayerSkeleton, true, v => FeatureActions.Apply("PlayerSkeleton", v),
+            new[] { "PlayerSkeleton" });
+        ToggleRow(L.T("玩家血量", "玩家血量", "Health bars"),
+            L.T("框顶显示当前血量", "框頂顯示當前血量", "HP bar over each box"),
+            Features.PlayerHealth, true, v => FeatureActions.Apply("PlayerHealth", v),
+            new[] { "PlayerHealth" });
+        EndSection();
+
+        BeginSection(L.T("生物与掉落物", "生物與掉落物", "Creatures & drops"));
+        ToggleRow(L.T("生物透视", "生物透視", "Creature ESP"),
+            L.T("隔墙显示生物(右键改色/样式)", "隔牆顯示生物(右鍵改色/樣式)", "Creatures through walls (right-click: color & style)"),
+            Features.CreatureEsp, true, v => FeatureActions.Apply("CreatureEsp", v),
+            new[] { "CreatureEsp" });
+        ToggleRow(L.T("物品透视", "物品透視", "Item ESP"),
+            L.T("隔墙显示掉落物(右键改色/距离)", "隔牆顯示掉落物(右鍵改色/距離)", "Dropped items through walls (right-click: color & distance)"),
+            Features.ItemEsp, true, v => FeatureActions.Apply("ItemEsp", v),
+            new[] { "ItemEsp" });
+        EndSection();
+
+        BeginSection(L.T("准星", "準星", "Crosshair"));
+        ToggleRow(L.T("屏幕准星", "螢幕準星", "Crosshair"),
+            L.T("不开镜时显示枪口指向的准星(右键改色/样式/大小)", "不開鏡時顯示槍口指向的準星(右鍵改色/樣式/大小)", "Muzzle-direction crosshair (right-click: color, style, size)"),
+            Features.Crosshair, true, v => FeatureActions.Apply("Crosshair", v),
+            new[] { "Crosshair" });
+        EndSection();
+
+        BeginSection(L.T("岛屿标签", "島嶼標籤", "Island labels"));
+        ToggleRow(L.T("岛屿标签", "島嶼標籤", "Island labels"),
+            L.T("屏幕显示所有岛屿的方向与距离", "螢幕顯示所有島嶼的方向與距離", "Every island's direction and distance on screen"),
+            Features.IslandLabels, true, v => FeatureActions.Apply("IslandLabels", v),
+            new[] { "IslandLabels" });
+        EndSection();
+    }
+
     // ────────────────────────── tab: items ──────────────────────────
 
     private static void TabItems(CheatController c)
@@ -998,7 +2100,7 @@ public static class MenuUi
             ItemDb.Load();
 
         BeginSection(L.T("生成选项", "生成選項", "Spawn Options"));
-        SliderRow(L.T("巨型倍率", "巨型倍率", "Giant Weight"), ref Features.GiantWeight, 1f, 50f, "x");
+        SliderRow(L.T("巨型倍率", "巨型倍率", "Giant size"), ref Features.GiantWeight, 1f, 50f, "x");
         ToggleRowInline(L.T("闪亮鱼", "閃亮魚", "Drip Fish"), Features.DripSpawn,
             v => FeatureActions.Apply("DripSpawn", v), new[] { "DripSpawn" });
         EndSection();
@@ -1051,7 +2153,7 @@ public static class MenuUi
 
         if (items.Count == 0)
             GUI.Label(new Rect(listRect.x + 10, listRect.y + listRect.height / 2 - 10, listRect.width - 20, 20),
-                L.T("没有匹配的物品", "沒有匹配的物品", "No matching items"), _labelDim);
+                L.T("没有匹配的物品", "沒有匹配的物品", "Nothing found"), _labelDim);
 
         // spawn buttons
         GUILayout.Space(8);
@@ -1059,7 +2161,7 @@ public static class MenuUi
         ButtonRow(
             canSpawn
                 ? L.T("刷 1 个", "刷 1 個", "Spawn 1")
-                : L.T("刷 1 个 (需选中+主机/联机桥)", "刷 1 個 (需選中+主機/聯機橋)", "Spawn 1 (need item + host/bridge)"),
+                : L.T("刷 1 个 (需选中+主机/联机桥)", "刷 1 個 (需選中+主機/聯機橋)", "Spawn 1 (pick an item first)"),
             L.T("刷 5 个", "刷 5 個", "Spawn 5"),
             canSpawn,
             () => { if (Features.HostAct(CheatAction.SpawnItem, amount: 1, itemId: Features.Selected.ID)) c.ShowToast(L.T("已生成 ", "已生成 ", "Spawned ") + ItemDb.NameOf(Features.Selected)); },
@@ -1087,21 +2189,28 @@ public static class MenuUi
 
     private static void TabCombat(CheatController c)
     {
+        BeginSection(L.T("伤害", "傷害", "Damage"));
+        ToggleRow(L.T("秒杀", "秒殺", "One-shot"),
+            L.T("你打出的每一击都是十万伤害", "你打出的每一擊都是十萬傷害", "Everything you hit takes 100,000 damage"),
+            Features.SelfOneShot, true, v => FeatureActions.Apply("SelfOneShot", v),
+            new[] { "SelfOneShot" });
+        EndSection();
+
         BeginSection(L.T("射击", "射擊", "Shooting"));
-        ToggleRow(L.T("无后座", "無後座", "No Recoil"),
-            L.T("视角与枪模都不再抖动", "視角與槍模都不再抖動", "No view or gun-model kick"),
+        ToggleRow(L.T("无后座", "無後座", "No recoil"),
+            L.T("视角与枪模都不再抖动", "視角與槍模都不再抖動", "Zero kick on your view and gun"),
             Features.NoRecoil, true, v => FeatureActions.Apply("NoRecoil", v),
             new[] { "NoRecoil" });
         ToggleRow(L.T("无扩散", "無擴散", "No Spread"),
-            L.T("散布归零,子弹沿枪口直线飞出(与镭射一致)", "散佈歸零,子彈沿槍口直線飛出(與鐳射一致)", "Zero spread; bullets fly straight along the muzzle (matches the laser)"),
+            L.T("散布归零,子弹沿枪口直线飞出(与镭射一致)", "散佈歸零,子彈沿槍口直線飛出(與鐳射一致)", "Bullets go exactly where the muzzle points"),
             Features.NoSpread, true, v => FeatureActions.Apply("NoSpread", v),
             new[] { "NoSpread" });
-        ToggleRow(L.T("无限子弹", "無限子彈", "Infinite Ammo"),
+        ToggleRow(L.T("无限子弹", "無限子彈", "Infinite ammo"),
             L.T("弹匣永远满,自动跳过换弹动作", "彈匣永遠滿,自動跳過換彈動作", "Magazine always full, reloads are skipped"),
             Features.InfiniteAmmo, true, v => FeatureActions.Apply("InfiniteAmmo", v),
             new[] { "InfiniteAmmo" });
         ToggleRow(L.T("快速射击", "快速射擊", "Fast Fire"),
-            L.T("所有枪械按下方倍率提升射速", "所有槍械按下方倍率提升射速", "All guns fire at the multiplier rate below"),
+            L.T("所有枪械按下方倍率提升射速", "所有槍械按下方倍率提升射速", "Every gun uses the rate multiplier"),
             Features.FastFire, true, v => FeatureActions.Apply("FastFire", v),
             new[] { "FastFire" });
         SliderRow(L.T("射速倍率", "射速倍率", "Fire Rate"), ref Features.FireRateMult, 1f, 10f, "x");
@@ -1117,34 +2226,28 @@ public static class MenuUi
 
         BeginSection(L.T("自瞄", "自瞄", "Aimbot"));
         ToggleRow(L.T("自瞄玩家", "自瞄玩家", "Aim Players"),
-            L.T("按住触发键自动跟踪其他玩家(默认右键,右键行可改绑)", "按住觸發鍵自動跟蹤其他玩家(預設右鍵,右鍵行可改綁)", "Auto-track other players while the trigger is held (default RMB, right-click the row to rebind)"),
+            L.T("按住触发键自动跟踪其他玩家(默认右键,右键行可改绑)", "按住觸發鍵自動跟蹤其他玩家(預設右鍵,右鍵行可改綁)", "Hold the trigger to lock the nearest player"),
             Features.Aimbot, true, v => FeatureActions.Apply("Aimbot", v),
             new[] { "Aimbot", Hotkeys.AimbotTrigger });
-        SliderRow(L.T("自瞄强度", "自瞄強度", "Aim Strength"), ref Features.AimbotStrength, 0.1f, 1f, "");
-        SliderRow(L.T("瞄准范围", "瞄準範圍", "Aim Range"), ref Features.AimbotMaxAngle, 5f, 90f, "°");
+        OptionRow(L.T("瞄准部位", "瞄準部位", "Aim point"),
+            new[] { L.T("身体", "身體", "Body"), L.T("头部", "頭部", "Head") },
+            ref Features.SilentAimPlayerPoint);
+        Features.SilentAimHead = Features.SilentAimPlayerPoint == 1;
+        ToggleRow(L.T("能一枪死打身体", "能一槍死打身體", "Body if lethal"),
+            L.T("开头部时,这一枪已经能打死就改打身体", "開頭部時,這一槍已經能打死就改打身體", "If a body shot already kills, aim body instead of head"),
+            Features.SilentAimBodyIfLethal, true, v => { Features.SilentAimBodyIfLethal = v; Settings.MarkDirty(); });
+        SliderRow(L.T("自瞄强度", "自瞄強度", "Smoothing"), ref Features.AimbotStrength, 0.1f, 1f, "");
+        SliderRow(L.T("瞄准范围", "瞄準範圍", "Lock cone"), ref Features.AimbotMaxAngle, 5f, 90f, "°");
         Hint(L.T("按住右键瞄准时锁定离准星最近的玩家并持续跟踪,打死或目标离开范围才换目标。",
                 "按住右鍵瞄準時鎖定離準星最近的玩家並持續跟蹤,打死或目標離開範圍才換目標。",
-                "Hold RMB to lock the player nearest the crosshair and keep tracking; the target only changes after it dies or leaves range."));
+                "Locks the player closest to your crosshair and follows until they die or leave the cone."));
+        ToggleRow(L.T("静默自瞄", "靜默自瞄", "Silent aim"),
+            L.T("子弹自动飞向准星附近的目标,视角不动", "子彈自動飛向準星附近的目標,視角不動", "Bullets curve to the nearest target — your view stays still"),
+            Features.SilentAim, true, v => FeatureActions.Apply("SilentAim", v),
+            new[] { "SilentAim" });
         EndSection();
 
-        BeginSection(L.T("透视", "透視", "ESP"));
-        ToggleRow(L.T("玩家透视", "玩家透視", "Player ESP"),
-            L.T("隔墙显示其他玩家的框与距离(右键行改框色)", "隔牆顯示其他玩家的框與距離(右鍵行改框色)", "Boxes and distance through walls (right-click the row for colors)"),
-            Features.PlayerEsp, true, v => FeatureActions.Apply("PlayerEsp", v),
-            new[] { "PlayerEsp" });
-        ToggleRow(L.T("玩家骨骼", "玩家骨骼", "Skeleton"),
-            L.T("隔墙显示其他玩家的骨架线条(右键行改骨色)", "隔牆顯示其他玩家的骨架線條(右鍵行改骨色)", "Bone lines through walls (right-click the row for colors)"),
-            Features.PlayerSkeleton, true, v => FeatureActions.Apply("PlayerSkeleton", v),
-            new[] { "PlayerSkeleton" });
-        ToggleRow(L.T("玩家血量", "玩家血量", "Health bars"),
-            L.T("框顶显示其他玩家当前血量", "框頂顯示其他玩家當前血量", "Current HP above the box"),
-            Features.PlayerHealth, true, v => FeatureActions.Apply("PlayerHealth", v),
-            new[] { "PlayerHealth" });
-        ToggleRow(L.T("屏幕准星", "螢幕準星", "Crosshair"),
-            L.T("不开镜时显示枪口指向的准星", "不開鏡時顯示槍口指向的準星", "Muzzle-direction crosshair when not aiming down sights"),
-            Features.Crosshair, true, v => FeatureActions.Apply("Crosshair", v),
-            new[] { "Crosshair" });
-        EndSection();
+
     }
 
     // ────────────────────────── tab: vehicle ──────────────────────────
@@ -1154,57 +2257,25 @@ public static class MenuUi
         BeginSection(L.T("船", "船", "Boat"));
         SliderRow(L.T("船速倍率", "船速倍率", "Boat Speed"), ref Features.BoatMult, 1f, 8f, "x");
         ToggleRow(L.T("载具飞行", "載具飛行", "Vehicle Flight"),
-            L.T("W前 S后 A左 D右 / Space升 Ctrl降,船头随视线", "W前 S後 A左 D右 / Space升 Ctrl降,船頭隨視線", "W fwd, S back, A left, D right / Space up, Ctrl down; bow follows your view"),
+            L.T("W前 S后 A左 D右 / Space升 Ctrl降,船头随视线", "W前 S後 A左 D右 / Space升 Ctrl降,船頭隨視線", "Fly in 6 directions — the bow follows your view"),
             Features.BoatFlight, true, v => FeatureActions.Apply("BoatFlight", v),
             new[] { "BoatFlight", Hotkeys.BoatFlightUp, Hotkeys.BoatFlightDown });
         EndSection();
 
-        BeginSection(L.T("导航", "導航", "Navigation"));
-        ToggleRow(L.T("岛屿标签", "島嶼標籤", "Island Labels"),
-            L.T("屏幕直接显示所有岛屿方向与距离", "螢幕直接顯示所有島嶼方向與距離", "All islands: direction and distance on screen"),
-            Features.IslandLabels, true, v => FeatureActions.Apply("IslandLabels", v),
-            new[] { "IslandLabels" });
-        Hint(L.T("在视野内显示标签,在屏幕外显示边缘方向点,无需看雷达。",
-                "在視野內顯示標籤,在螢幕外顯示邊緣方向點,無需看雷達。",
-                "Labels for islands in view, edge direction dots for the rest — no radar needed."));
-        EndSection();
+
 
         BeginSection(null);
         Hint(L.T("发动油门时按倍率推进,关闭滑条或调回 1x 自动还原。",
                 "發動油門時按倍率推進,關閉滑條或調回 1x 自動還原。",
-                "Throttle scales by the multiplier; sliding back to 1x restores the original values."));
+                "Boat speed = throttle × multiplier. Back to 1x = stock."));
         EndSection();
     }
 
     // ────────────────────────── tab: fun ──────────────────────────
 
-    private static void TabFun(CheatController c)
+
+    private static void TabWorld(CheatController c)
     {
-        BeginSection(L.T("旅行", "旅行", "Travel"));
-        ButtonRow(L.T("传送下一座岛", "傳送下一座島", "Next Island"), L.T("上一座岛", "上一座島", "Prev Island"), Features.CanHostAct, () =>
-        {
-            if (Features.HostAct(CheatAction.NextIsland, flag: false))
-                c.ShowToast(L.T("跳转下一座岛…", "跳轉下一座島…", "Jumping to the next island…"));
-        }, () =>
-        {
-            if (Features.HostAct(CheatAction.NextIsland, flag: true))
-                c.ShowToast(L.T("返回上一座岛…", "返回上一座島…", "Returning to the previous island…"));
-        });
-        EndSection();
-
-        BeginSection(L.T("轮盘赌", "輪盤賭", "Roulette"));
-        ToggleRow(L.T("轮盘必中", "輪盤必中", "Roulette Auto-Win"),
-            L.T("球出手后强制滚进你下注的颜色(物理干预)", "球出手後強制滾進你下注的顏色(物理干預)", "Physically forces the ball into your bet color after launch"),
-            Features.RouletteAutoWin, Features.CanHostAct, v =>
-        {
-            Features.RouletteAutoWin = v;
-            Features.HostAct(CheatAction.RouletteAutoWin, flag: v);
-        });
-        Hint(L.T("赌局旋转时顶部自动显示落点预测与稳定倒计时(球停稳 2 秒判胜)。",
-                "賭局旋轉時頂部自動顯示落點預測與穩定倒數(球停穩 2 秒判勝)。",
-                "During spins the overlay shows the landing prediction and settle countdown (2s dwell wins)."));
-        EndSection();
-
         BeginSection(L.T("世界", "世界", "World"));
         ButtonRow(L.T("秒杀当前 Boss", "秒殺當前 Boss", "Kill Current Boss"), null, Features.CanHostAct, () =>
         {
@@ -1223,14 +2294,126 @@ public static class MenuUi
         });
         EndSection();
 
+        BeginSection(L.T("掉落物", "掉落物", "Dropped items"));
+        ButtonRow(L.T("清除所有掉落物", "清除所有掉落物", "Clear all drops"),
+            L.T("清除(保留武器)", "清除(保留武器)", "Clear (keep guns)"), Features.CanHostAct, () =>
+        {
+            int n = Features.ClearDroppedItems(false);
+            c.ShowToast(string.Format(L.T("已清除 {0} 个掉落物", "已清除 {0} 個掉落物", "Cleared {0} drops"), n));
+        }, () =>
+        {
+            int n = Features.ClearDroppedItems(true);
+            c.ShowToast(string.Format(L.T("已清除 {0} 个掉落物(武器保留)", "已清除 {0} 個掉落物(武器保留)", "Cleared {0} drops (guns kept)"), n));
+        });
+        EndSection();
+
         BeginSection(L.T("收藏", "收藏", "Collection"));
         ButtonRow(L.T("解锁全部皮肤", "解鎖全部皮膚", "Unlock All Skins"), null, true, () =>
         {
             int n = Features.UnlockAllSkins();
             c.ShowToast(n >= 0
-                ? string.Format(L.T("已解锁 {0} 个皮肤", "已解鎖 {0} 個皮膚", "Unlocked {0} skins"), n)
+                ? string.Format(L.T("已解锁 {0} 个皮肤", "已解鎖 {0} 個皮膚", "{0} skins unlocked"), n)
                 : L.T("解锁失败,看日志", "解鎖失敗,看日誌", "Unlock failed — check the log"));
         }, null);
+        EndSection();
+    }
+
+    // ────────────────────────── tab: casino ──────────────────────────
+
+    private static void TabCasino(CheatController c)
+    {
+        BeginSection(L.T("轮盘赌", "輪盤賭", "Roulette"));
+        ToggleRow(L.T("轮盘必中", "輪盤必中", "Roulette: always win"),
+            L.T("球出手后强制滚到下注颜色(物理干预)", "球出手後強制滾到下注顏色(物理干預)", "Physically forces the ball into your bet color"),
+            Features.RouletteAutoWin, Features.CanHostAct, v =>
+        {
+            Features.RouletteAutoWin = v;
+            Features.HostAct(CheatAction.RouletteAutoWin, flag: v);
+        });
+        Hint(L.T("赌局旋转时顶部自动显示落点预测与稳定倒计时(球停稳 2 秒判胜)。",
+                "賭局旋轉時頂部自動顯示落點預測與穩定倒數(球停穩 2 秒判勝)。",
+                "While the wheel spins, the overlay shows the landing color and a settle countdown (2s = result)."));
+        EndSection();
+
+        BeginSection(L.T("老虎机", "老虎機", "Slot machine"));
+        ToggleRow(L.T("结果预测", "結果預測", "Spin preview"),
+            L.T("开转瞬间显示中奖结果(人人可见)", "開轉瞬間顯示中獎結果(人人可見)", "Shows the winning prize the moment the spin starts"),
+            Features.SlotPredict, true, v => FeatureActions.Apply("SlotPredict", v),
+            new[] { "SlotPredict" });
+        OptionRow(L.T("必中品质", "必中品質", "Force rarity"),
+            new[]
+            {
+                L.T("关", "關", "Off"),
+                L.T("稀有", "稀有", "Rare"),
+                L.T("传说", "傳說", "Legendary"),
+            },
+            ref Features.SlotCheatRarity);
+        Hint(L.T("必中需要主机;从奖品池里随机挑一件对应品质。指定皮肤优先于品质。",
+                "必中需要主機;從獎品池裡隨機挑一件對應品質。指定皮膚優先於品質。",
+                "Host only; a random prize of that rarity. An exact skin pick below wins over this."));
+        EndSection();
+
+        BeginSection(L.T("指定皮肤", "指定皮膚", "Exact prize"));
+        var items = SlotMachine.AvailableItems;
+        if (items == null || items.Length == 0)
+        {
+            Hint(L.T("先进一次赌场,奖池加载后再来。", "先進一次賭場,獎池加載後再來。", "Enter the casino once — the prize pool loads there."));
+        }
+        else
+        {
+            foreach (var it in items)
+            {
+                if (it == null || it.SkinPreset == null)
+                    continue;
+                var skins = it.SkinPreset.Skins;
+                for (byte i = 0; i < skins.Count; i++)
+                {
+                    var rar = skins[i].Rarity;
+                    string tag = rar == Rarity.Legendary ? L.T("传说", "傳說", "★")
+                               : rar == Rarity.Rare ? L.T("稀有", "稀有", "Rare") : "";
+                    string txt = ItemDb.NameOf(it) + (tag != "" ? " · " + tag : "");
+                    int itemId = it.ID;
+                    byte skinIdx = i;
+                    ButtonRow(txt, null, true, () =>
+                    {
+                        Features.SlotSkinItemId = itemId;
+                        Features.SlotSkinIndex = skinIdx;
+                        Settings.MarkDirty();
+                        c.ShowToast(L.T("已指定: ", "已指定: ", "Locked: ") + txt);
+                    }, null);
+                }
+            }
+            ButtonRow(L.T("清除指定皮肤", "清除指定皮膚", "Clear exact prize"), null, Features.SlotSkinItemId >= 0, () =>
+            {
+                Features.SlotSkinItemId = -1;
+                Settings.MarkDirty();
+                c.ShowToast(L.T("已清除,回到品质模式", "已清除,回到品質模式", "Cleared — back to rarity mode"));
+            }, null);
+        }
+        EndSection();
+
+
+    }
+
+    // ────────────────────────── tab: fishing ──────────────────────────
+
+    private static void TabFishing(CheatController c)
+    {
+        BeginSection(L.T("上钩控制", "上鉤控制", "Hook control"));
+        ToggleRow(L.T("秒上钩", "秒上鉤", "Instant bite"),
+            L.T("鱼饵入水立即挂上一条随机鱼,需主机", "魚餌入水立即掛上一條隨機魚,需主機", "A random fish hooks the moment the bait hits the water (host)"),
+            Features.BaitInstant, Features.CanHostAct, v => FeatureActions.Apply("BaitInstant", v),
+            new[] { "BaitInstant" });
+        ToggleRow(L.T("指定上钩鱼", "指定上鉤魚", "Hook any fish"),
+            L.T("上钩的=物品页选中的生物,需主机", "上鉤的=物品頁選中的生物,需主機", "Hooks the creature you picked in Items (host)"),
+            Features.BaitFish, Features.CanHostAct, v => FeatureActions.Apply("BaitFish", v),
+            new[] { "BaitFish" });
+        EndSection();
+
+        BeginSection(null);
+        Hint(L.T("去物品页选中一条鱼(带\"生物\"标签的),指定上钩会优先用它。",
+                "去物品頁選中一條魚(帶\"生物\"標籤的),指定上鉤會優先用它。",
+                "Pick a creature in the Items tab — \"Hook any fish\" uses it when set."));
         EndSection();
     }
 
@@ -1246,24 +2429,30 @@ public static class MenuUi
             case Hotkeys.PlayerFlightDown: return L.T("玩家飞行 · 下降", "玩家飛行 · 下降", "Player flight · down");
             case Hotkeys.BoatFlightUp: return L.T("载具飞行 · 上升", "載具飛行 · 上升", "Boat flight · up");
             case Hotkeys.BoatFlightDown: return L.T("载具飞行 · 下降", "載具飛行 · 下降", "Boat flight · down");
-            case "GodMode": return L.T("上帝模式", "上帝模式", "God Mode");
-            case "FullnessLock": return L.T("锁满饱食度", "鎖滿飽食度", "Fullness Lock");
-            case "KeepInventory": return L.T("保留物品栏", "保留物品欄", "Keep Inventory");
-            case "PlayerFlight": return L.T("玩家飞行", "玩家飛行", "Player Flight");
-            case "ThirdPerson": return L.T("第三人称", "第三人稱", "Third Person");
-            case "SelfOneShot": return L.T("秒杀", "秒殺", "One Shot");
+            case "GodMode": return L.T("上帝模式", "上帝模式", "God mode");
+            case "FullnessLock": return L.T("锁满饱食度", "鎖滿飽食度", "No hunger");
+            case "KeepInventory": return L.T("保留物品栏", "保留物品欄", "Keep inventory");
+            case "PlayerFlight": return L.T("玩家飞行", "玩家飛行", "Flight");
+            case "ThirdPerson": return L.T("第三人称", "第三人稱", "Third person");
+            case "SelfOneShot": return L.T("秒杀", "秒殺", "One-shot");
             case "BuiltInCheats": return L.T("游戏内置作弊", "遊戲內置作弊", "Built-in Cheats");
-            case "NoRecoil": return L.T("无后座", "無後座", "No Recoil");
+            case "NoRecoil": return L.T("无后座", "無後座", "No recoil");
             case "NoSpread": return L.T("无扩散", "無擴散", "No Spread");
-            case "InfiniteAmmo": return L.T("无限子弹", "無限子彈", "Infinite Ammo");
+            case "InfiniteAmmo": return L.T("无限子弹", "無限子彈", "Infinite ammo");
             case "Aimbot": return L.T("自瞄玩家", "自瞄玩家", "Aim Players");
-            case "PlayerEsp": return L.T("玩家透视", "玩家透視", "Player ESP");
+            case "PlayerEsp": return L.T("玩家透视", "玩家透視", "Boxes");
             case "PlayerSkeleton": return L.T("玩家骨骼", "玩家骨骼", "Skeleton");
             case "PlayerHealth": return L.T("玩家血量", "玩家血量", "Health bars");
             case "Crosshair": return L.T("屏幕准星", "螢幕準星", "Crosshair");
+            case "SilentAim": return L.T("静默自瞄", "靜默自瞄", "Silent aim");
+            case "CreatureEsp": return L.T("生物透视", "生物透視", "Creature ESP");
+            case "ItemEsp": return L.T("物品透视", "物品透視", "Item ESP");
             case "BoatFlight": return L.T("载具飞行", "載具飛行", "Vehicle Flight");
-            case "IslandLabels": return L.T("岛屿标签", "島嶼標籤", "Island Labels");
+            case "IslandLabels": return L.T("岛屿标签", "島嶼標籤", "Island labels");
             case "DripSpawn": return L.T("闪亮鱼", "閃亮魚", "Drip Fish");
+            case "SlotPredict": return L.T("老虎机预测", "老虎機預測", "Spin preview");
+            case "BaitFish": return L.T("指定上钩鱼", "指定上鉤魚", "Hook any fish");
+            case "BaitInstant": return L.T("秒上钩", "秒上鉤", "Instant bite");
             default: return action;
         }
     }
@@ -1292,7 +2481,7 @@ public static class MenuUi
         BeginSection(null);
         Hint(L.T("在功能行上直接右键也能弹出绑定窗口。点击按钮后按下新按键(鼠标键也可以),Esc 取消。",
                 "在功能行上直接右鍵也能彈出綁定視窗。點擊按鈕後按下新按鍵(鼠標鍵也可以),Esc 取消。",
-                "You can also right-click a feature row to open the bind popup. Click a button, then press the new key (mouse works too). Esc cancels."));
+                "Right-click any row to rebind it. Click a bind, press the new key (mouse works too). Esc cancels."));
         EndSection();
     }
 
@@ -1333,9 +2522,10 @@ public static class MenuUi
         bool folded = _folded.TryGetValue(title, out var f) && f;
         _fold = folded;
 
-        var r = GUILayoutUtility.GetRect(0, 20, GUILayout.ExpandWidth(true));
-        GUI.Label(new Rect(r.x, r.y + 2, r.width - 20, 18),
+        var r = GUILayoutUtility.GetRect(0, 22, GUILayout.ExpandWidth(true));
+        GUI.Label(new Rect(r.x, r.y + 1, r.width - 20, 18),
             (folded ? "▸  " : "▾  ") + title.ToUpperInvariant(), _labelDim);
+        DrawFill(new Rect(r.x, r.yMax - 1, r.width, 1), new Color(1f, 1f, 1f, 0.045f));
         if (Event.current.type == EventType.MouseDown && r.Contains(Event.current.mousePosition))
         {
             _folded[title] = !folded;
@@ -1364,9 +2554,13 @@ public static class MenuUi
     {
         if (_fold)
             return;
-        var r = GUILayoutUtility.GetRect(0, 36, GUILayout.ExpandWidth(true));
+        // adaptive height: the sub text wraps in the narrower page column
+        float subW = WinW - 14f - NavW - NavGap - 14f - 60f;
+        float subH = _labelDim.CalcHeight(new GUIContent(sub), subW);
+        float rowH = Mathf.Max(36f, 21f + subH + 8f);
+        var r = GUILayoutUtility.GetRect(0, rowH, GUILayout.ExpandWidth(true));
         GUI.Label(new Rect(r.x, r.y + 2, r.width - 60, 18), label, _label);
-        GUI.Label(new Rect(r.x, r.y + 19, r.width - 60, 16), sub, _labelDim);
+        GUI.Label(new Rect(r.x, r.y + 19, r.width - 60, subH + 3), sub, _labelDim);
 
         // right-click on a bindable row → neverlose-style keybind popup
         if (bindActions != null && Event.current.type == EventType.MouseDown
@@ -1550,7 +2744,8 @@ public static class MenuUi
         _label = Style(null, CText, 13, rich: true);
         _labelDim = Style(null, CTextDim, 11, rich: true);
         _labelDim.wordWrap = true; // long hint lines must wrap, not widen the tab (no h-scrollbar)
-        _labelSmall = Style(null, CText, 12);
+        _labelSmall = Style(null, CText, 13);
+        _labelSmall.richText = true;
         _value = Style(null, CAccent, 13, align: TextAnchor.UpperRight, rich: true);
         _hint = Style(null, new Color(0.75f, 0.79f, 0.82f, 0.85f), 11);
 

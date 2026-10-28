@@ -34,6 +34,7 @@ public class CheatController : MonoBehaviour
             Hotkeys.TickToggles();
             Multiplayer.Tick();
             Roulette.Tick();
+            Features.TickBaitFish();
             Combat.Tick(MenuOpen);
             Features.TickBoatFlight();
             if (Features.ThirdPerson)

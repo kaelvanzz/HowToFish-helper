@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
+using HarmonyLib;
 using UnityEngine;
 
 namespace HTFMod;
@@ -142,10 +144,28 @@ public static class Combat
                 {
                     try
                     {
+                        // Vanilla values come from the CLEAN PREFAB, not the instance —
+                        // instances may carry spread/rate corrupted by older sessions
+                        // (and saved), which is why NoSpread-off kept shotguns merged.
                         orig = (
                             _fiTbs != null ? Convert.ToSingle(_fiTbs.GetValue(w)) : 0f,
                             _fiFullAuto != null && (bool)_fiFullAuto.GetValue(w),
                             _fiSpread != null ? Convert.ToSingle(_fiSpread.GetValue(w)) : 0f);
+                        try
+                        {
+                            var prefabItem = GameInfo.IDToItem(w.ID);
+                            var pw = prefabItem != null ? prefabItem.Weapon : null;
+                            if (pw != null)
+                            {
+                                if (_fiTbs != null)
+                                    orig.tbs = Convert.ToSingle(_fiTbs.GetValue(pw));
+                                if (_fiFullAuto != null)
+                                    orig.auto = (bool)_fiFullAuto.GetValue(pw);
+                                if (_fiSpread != null)
+                                    orig.spread = Convert.ToSingle(_fiSpread.GetValue(pw));
+                            }
+                        }
+                        catch { }
                         _weaponOrig[w] = orig;
                     }
                     catch { continue; }
@@ -192,6 +212,317 @@ public static class Combat
     /// <summary>True while the aimbot should pull the view toward AimPoint.</summary>
     public static bool AimActive => _aimActive;
 
+    /// <summary>
+    /// Shared target search. Priority: 0 = closest to crosshair, 1 = closest distance,
+    /// 2 = lowest HP. aimHead aims at the head instead of the chest.
+    /// </summary>
+    internal static Player FindTarget(Vector3 camPos, Vector3 forward, float maxAngle, bool aimHead, int priority, float aimHeight, out Vector3 aimPoint)
+    {
+        aimPoint = default;
+        Player best = null;
+        float bestScore = float.MaxValue;
+        Vector3 bestAim = Vector3.zero;
+        float bestHp = float.MaxValue;
+
+        foreach (var pl in PlayerManager.AlivePlayers)
+        {
+            if (pl == null || pl == Player.LocalPlayer)
+                continue;
+            try
+            {
+                Vector3 tp = AimPointOf(pl, out var _, aimHead);
+                Vector3 to = tp - camPos;
+                float dist = to.magnitude;
+                if (dist < 0.4f || dist > 200f)
+                    continue;
+
+                float angle = Vector3.Angle(forward, to);
+                if (angle >= maxAngle)
+                    continue;
+
+                float score = priority switch
+                {
+                    1 => dist,
+                    2 => HealthOf(pl),
+                    _ => angle,
+                };
+
+                if (score < bestScore || (priority == 2 && score <= bestHp + 0.001f && best == null))
+                {
+                    best = pl;
+                    bestScore = score;
+                    bestHp = score;
+                    bestAim = tp;
+                }
+            }
+            catch { }
+        }
+
+        aimPoint = bestAim;
+        return best;
+    }
+
+    private static int HealthOf(Player pl)
+    {
+        try { return pl.Vitals != null ? pl.Vitals._syncedHealth.Value : 100; }
+        catch { return 100; }
+    }
+
+    /// <summary>Silent aim: where the bullet should go (null = no target in cone).
+    /// Target type: players / creatures / both, resolved by the priority metric.</summary>
+    internal static Vector3? SilentTarget(Vector3 camPos, Vector3 forward, out Vector3 targetVel)
+    {
+        targetVel = Vector3.zero;
+        Player bestP = null;
+        Vector3 bestPAim = default;
+        if (Features.SilentAimPlayers)
+            bestP = FindTarget(camPos, forward, Features.SilentAimAngle, WantPlayerHead(), Features.SilentAimPriority, Features.SilentAimHeight, out bestPAim);
+
+        Creature bestC = null;
+        Vector3 bestCAim = default;
+        float bestCScore = float.MaxValue;
+        if (Features.SilentAimCreatures)
+        {
+            ScanSaCreatures();
+            foreach (var cr in _saCreatures)
+            {
+                if (cr == null)
+                    continue;
+                try
+                {
+                    Vector3 tp = CreatureAimPoint(cr, camPos);
+                    Vector3 to = tp - camPos;
+                    float dist = to.magnitude;
+                    if (dist < 0.25f || dist > 200f)
+                        continue;
+                    float angle = Vector3.Angle(forward, to);
+                    if (angle >= Features.SilentAimAngle)
+                        continue;
+                    float score = Features.SilentAimPriority switch
+                    {
+                        1 => dist,
+                        2 => HealthOfCreature(cr),
+                        _ => angle,
+                    };
+                    if (score < bestCScore)
+                    {
+                        bestCScore = score;
+                        bestC = cr;
+                        bestCAim = tp;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        if (bestP == null && bestC == null)
+            return null;
+        if (bestP == null)
+        {
+            targetVel = _saVel.TryGetValue(bestC, out var cv) ? cv : Vector3.zero;
+            return bestCAim;
+        }
+        if (bestC == null)
+        {
+            try { targetVel = bestP.Rigidbody != null ? bestP.Rigidbody.linearVelocity : Vector3.zero; }
+            catch { targetVel = Vector3.zero; }
+            return bestPAim;
+        }
+
+        // both worlds have a candidate — the priority metric decides
+        float pS = Features.SilentAimPriority switch
+        {
+            1 => (bestPAim - camPos).magnitude,
+            2 => HealthOf(bestP),
+            _ => Vector3.Angle(forward, bestPAim - camPos),
+        };
+        float cS = Features.SilentAimPriority switch
+        {
+            1 => (bestCAim - camPos).magnitude,
+            2 => HealthOfCreature(bestC),
+            _ => Vector3.Angle(forward, bestCAim - camPos),
+        };
+        if (cS < pS)
+        {
+            targetVel = _saVel.TryGetValue(bestC, out var cv) ? cv : Vector3.zero;
+            return bestCAim;
+        }
+        try { targetVel = bestP.Rigidbody != null ? bestP.Rigidbody.linearVelocity : Vector3.zero; }
+        catch { targetVel = Vector3.zero; }
+        return bestPAim;
+    }
+
+    /// <summary>
+    /// Build a muzzle-to-target direction. Lead is capped so circling fish do not
+    /// get overshot; gravity lifts the aim for ballistic (non-hitscan) shots.
+    /// </summary>
+    internal static bool TrySilentAimDir(Vector3 muzzle, float speed, float gravity, out Vector3 dir)
+    {
+        dir = default;
+        var cam = GameInfo.CurCamera;
+        if (cam == null)
+            return false;
+        var target = SilentTarget(cam.transform.position, cam.transform.forward, out var tVel);
+        if (target == null)
+            return false;
+
+        Vector3 aim = target.Value;
+        Vector3 to = aim - muzzle;
+        float dist = to.magnitude;
+        if (dist < 0.35f)
+            return false;
+
+        if (Features.SilentAimPredict && tVel.sqrMagnitude > 0.04f && speed > 1f)
+        {
+            float t = Mathf.Clamp(dist / speed, 0f, 0.32f);
+            Vector3 lead = tVel * t;
+            float leadCap = Mathf.Clamp(dist * 0.12f, 0.35f, 3.5f);
+            if (lead.sqrMagnitude > leadCap * leadCap)
+                lead = lead.normalized * leadCap;
+            aim += lead;
+            if (gravity > 0.05f)
+            {
+                float t2 = Mathf.Clamp((aim - muzzle).magnitude / speed, 0f, 0.32f);
+                aim += Vector3.up * (0.5f * gravity * t2 * t2);
+            }
+        }
+
+        dir = aim - muzzle;
+        return dir.sqrMagnitude > 0.12f;
+    }
+
+    /// <summary>
+    /// Snap onto a live collider instead of the AABB center. Thin / rotated fish
+    /// have an AABB that sticks out of the mesh, so aiming at bounds.center misses.
+    /// </summary>
+    private static Vector3 CreatureAimPoint(Creature cr, Vector3 from)
+    {
+        try
+        {
+            var cols = cr.GetComponentsInChildren<Collider>();
+            if (cols != null && cols.Length > 0)
+            {
+                Collider best = null;
+                float bestVol = -1f;
+                for (int i = 0; i < cols.Length; i++)
+                {
+                    var c = cols[i];
+                    if (c == null || !c.enabled) continue;
+                    Vector3 sz = c.bounds.size;
+                    float vol = sz.x * sz.y * sz.z;
+                    if (vol > bestVol)
+                    {
+                        bestVol = vol;
+                        best = c;
+                    }
+                }
+                if (best != null)
+                {
+                    var b = best.bounds;
+                    float y = Mathf.Lerp(b.min.y, b.max.y, Mathf.Clamp01(Features.SilentAimHeight));
+                    Vector3 sample = new Vector3(b.center.x, y, b.center.z);
+                    Vector3 to = sample - from;
+                    float dist = to.magnitude;
+                    if (dist > 0.05f)
+                    {
+                        try
+                        {
+                            int layers = (int)GameInfo.ProjectileHitLayer
+                                       | (int)GameInfo.ItemLayer
+                                       | (int)GameInfo.NpcLayer;
+                            if (Physics.SphereCast(from, 0.08f, to / dist, out var hit, dist + 1.5f, layers,
+                                    QueryTriggerInteraction.Collide)
+                                && hit.transform != null
+                                && hit.transform.IsChildOf(cr.transform))
+                                return hit.point;
+                        }
+                        catch { }
+                    }
+                    try
+                    {
+                        Vector3 onCol = best.ClosestPoint(sample);
+                        if ((onCol - from).sqrMagnitude > 0.01f)
+                            return onCol;
+                    }
+                    catch { }
+                    return sample;
+                }
+            }
+        }
+        catch { }
+        return cr.transform.position + Vector3.up * Mathf.Lerp(0.15f, 0.7f, Features.SilentAimHeight);
+    }
+
+    private static void ScanSaCreatures()
+    {
+        if (Time.unscaledTime < _saNextScan)
+            return;
+        _saNextScan = Time.unscaledTime + 0.08f;
+        _saCreatures.Clear();
+        float now = Time.unscaledTime;
+        var seen = new HashSet<Creature>();
+        try
+        {
+            foreach (var cr in UnityEngine.Object.FindObjectsByType<Creature>(
+                FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+            {
+                if (cr == null)
+                    continue;
+                try
+                {
+                    if (cr.IsDead || !cr.IsSpawned)
+                        continue;
+                }
+                catch { continue; }
+                seen.Add(cr);
+                var cur = cr.transform.position;
+                if (_saLastPos.TryGetValue(cr, out var lp))
+                {
+                    float dt = now - _saLastT[cr];
+                    if (dt > 0.02f && dt < 0.45f)
+                    {
+                        Vector3 raw = (cur - lp) / dt;
+                        // teleport / scan hitch → drop the sample instead of leading 100m
+                        if (raw.sqrMagnitude > 1600f)
+                            raw = Vector3.zero;
+                        if (_saVel.TryGetValue(cr, out var old))
+                            _saVel[cr] = Vector3.Lerp(old, raw, 0.4f);
+                        else
+                            _saVel[cr] = raw;
+                    }
+                }
+                _saLastPos[cr] = cur;
+                _saLastT[cr] = now;
+                _saCreatures.Add(cr);
+            }
+            // prune despawned creatures
+            List<Creature> gone = null;
+            foreach (var k in _saLastPos.Keys)
+                if (!seen.Contains(k))
+                    (gone ??= new List<Creature>()).Add(k);
+            if (gone != null)
+                foreach (var k in gone)
+                {
+                    _saLastPos.Remove(k);
+                    _saLastT.Remove(k);
+                    _saVel.Remove(k);
+                }
+        }
+        catch { }
+    }
+
+    private static readonly List<Creature> _saCreatures = new();
+    private static readonly Dictionary<Creature, Vector3> _saVel = new();
+    private static readonly Dictionary<Creature, Vector3> _saLastPos = new();
+    private static readonly Dictionary<Creature, float> _saLastT = new();
+    private static float _saNextScan;
+
+    private static int HealthOfCreature(Creature cr)
+    {
+        try { return cr.Hp; }
+        catch { return int.MaxValue; }
+    }
+
     private static void TickAimbot(Player p, bool menuOpen)
     {
         try
@@ -226,7 +557,7 @@ public static class Combat
             {
                 if (GetPlayerBounds(_lockedPlayer, out var b))
                 {
-                    Vector3 ap = ChestPoint(_lockedPlayer, b);
+                    Vector3 ap = ChestPoint(_lockedPlayer, b, AimHeadFor(_lockedPlayer));
                     if (LockValid(ap, camPos, forward, maxAngle))
                     {
                         _aimPoint = ap;
@@ -239,33 +570,7 @@ public static class Combat
             _aimActive = false;
 
             // Re-acquire: closest-to-crosshair alive player inside the cone
-            Player best = null;
-            float bestAngle = maxAngle;
-            Vector3 bestAim = Vector3.zero;
-
-            foreach (var pl in PlayerManager.AlivePlayers)
-            {
-                if (pl == null || pl == Player.LocalPlayer)
-                    continue;
-                try
-                {
-                    Vector3 tp = AimPointOf(pl, out var _);
-                    Vector3 to = tp - camPos;
-                    float dist = to.magnitude;
-                    if (dist < 1.5f || dist > 160f)
-                        continue;
-
-                    float angle = Vector3.Angle(forward, to);
-                    if (angle >= bestAngle)
-                        continue;
-
-                    best = pl;
-                    bestAngle = angle;
-                    bestAim = tp;
-                }
-                catch { }
-            }
-
+            var best = FindTarget(camPos, forward, maxAngle, WantPlayerHead(), 0, 0.65f, out var bestAim);
             if (best == null)
                 return;
 
@@ -330,23 +635,56 @@ public static class Combat
         Loader.Log("Aimbot error: " + e.Message);
     }
 
-    /// <summary>
-    /// Stable chest/neck aim point: 65% up the visible body, XZ from the render
-    /// bounds. Bounds exclude floating name tags (see GetPlayerBounds) so the Y
-    /// no longer jumps between with-tag and without-tag frames.
-    /// </summary>
-    private static Vector3 AimPointOf(Player pl, out Bounds b)
+    /// <summary>Head unless "body if lethal" and this shot would already kill.</summary>
+    private static bool WantPlayerHead()
     {
-        if (GetPlayerBounds(pl, out b))
-            return ChestPoint(pl, b);
-        return pl.Transform.position + Vector3.up * 1.35f;
+        return Features.SilentAimPlayerPoint == 1 || Features.SilentAimHead;
     }
 
-    private static Vector3 ChestPoint(Player pl, Bounds b)
+    private static bool AimHeadFor(Player pl)
+    {
+        if (!WantPlayerHead())
+            return false;
+        if (!Features.SilentAimBodyIfLethal)
+            return true;
+        int dmg = LocalShotDamage();
+        if (dmg <= 0)
+            return true;
+        return HealthOf(pl) > dmg;
+    }
+
+    private static int LocalShotDamage()
+    {
+        try
+        {
+            var p = Player.LocalPlayer;
+            var held = p != null && p.Holding != null ? p.Holding.HeldItem : null;
+            var w = held != null ? held.Weapon : null;
+            if (w == null)
+                return 0;
+            var m = AccessTools.Method(typeof(Weapon), "GetShotDamage");
+            if (m == null)
+                return 0;
+            return Convert.ToInt32(m.Invoke(w, null));
+        }
+        catch { return 0; }
+    }
+
+    private static Vector3 AimPointOf(Player pl, out Bounds b, bool head = false)
+    {
+        if (head && Features.SilentAimBodyIfLethal && !AimHeadFor(pl))
+            head = false;
+        if (GetPlayerBounds(pl, out b))
+            return ChestPoint(pl, b, head);
+        return pl.Transform.position + Vector3.up * (head ? 1.6f : 1.35f);
+    }
+
+    private static Vector3 ChestPoint(Player pl, Bounds b, bool head = false)
     {
         float baseY = pl.Transform.position.y;
         float top = Mathf.Min(b.max.y, baseY + 2.0f);
-        return new Vector3(b.center.x, Mathf.Lerp(baseY + 0.8f, top, 0.65f), b.center.z);
+        float y = head ? top - 0.08f : Mathf.Lerp(baseY + 0.8f, top, 0.65f);
+        return new Vector3(b.center.x, y, b.center.z);
     }
 
     /// <summary>

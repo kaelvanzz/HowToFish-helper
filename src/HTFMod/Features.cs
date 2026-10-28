@@ -29,20 +29,70 @@ public static class Features
     public static bool KeepInventory;    // no drops on death/respawn
     public static bool SelfOneShot;      // own attacks deal fixed 100000 damage
     public static bool Aimbot;           // aim players while holding RMB
-    public static bool Crosshair;        // screen-center crosshair when not aiming down sights
+    public static bool Crosshair;        // muzzle-direction crosshair
+    public static bool SilentAim;             // redirect bullets to the cone target, no camera move
+    public static bool SilentAimPredict = true; // lead the target by its velocity
+    public static int SilentAimPriority = 0;  // 0 crosshair / 1 distance / 2 lowest HP
+    public static int SilentAimTarget = 2;    // 0 players / 1 creatures / 2 both (legacy)
+    public static bool SilentAimPlayers = true;
+    public static bool SilentAimCreatures = true;
+    public static bool SilentAimHead;         // aim at the head instead of the chest (legacy)
+    public static int SilentAimPlayerPoint;   // 0 body / 1 head — visual aimbot + silent aim vs players
+    public static bool SilentAimBodyIfLethal = true; // if one shot kills, aim body instead of head
+    public static float SilentAimAngle = 60f; // target search cone (deg)
+    public static bool CreatureEsp;             // creature boxes + name tags through walls
+    public static bool CreatureLabel = true;    // name+distance text over creature boxes
+    public static bool CreatureFrame = true;    // corner frame
+    public static bool CreatureFill;            // translucent AABB fill
+    public static bool CreatureSilhouette;      // outermost mesh outline
+    public static float CreatureEspDist = 150f; // creature label max distance
+    public static bool ItemEsp;                 // dropped item labels through walls
+    public static bool ItemLabel = true;        // name+distance text over items
+    public static bool ItemFrame;               // corner frame
+    public static bool ItemFill;                // translucent fill
+    public static int LabelSize = 12;           // ESP label font size (players/creatures/items)
+    public static int ItemEspStyle = 0;         // 0 label only / 1 corners
     public static float AimbotStrength = 0.5f;
     public static float AimbotMaxAngle = 30f;
     public static bool PlayerEsp;
+    public static bool PlayerLabel = true;  // name+distance text over player boxes
     public static bool PlayerSkeleton;      // draw bone lines for other players
     public static bool PlayerHealth;        // health bar above the box
     public static int EspBoxColor = 0xF24C4C;      // packed 0xRRGGBB
     public static int EspSkeletonColor = 0x4CE65E; // packed 0xRRGGBB
+    public static int EspCreatureColor = 0xCC73F2; // packed 0xRRGGBB, muted purple
+    public static int EspItemColor = 0xE0B85C;     // warm gold, distinct from water/UI teal
+    public static int CrosshairColor = 0xF2F2F2;   // packed 0xRRGGBB
+    public static int EspFillColor = 0xF24C4C;      // player box fill
+    public static int EspCreatureFillColor = 0xCC73F2; // creature box fill
+    public static int EspItemFillColor = 0xE0B85C;     // item box fill
+    public static float EspOutlineWidth = 1f;       // ESP outline thickness
+    public static int PlayerBoxStyle = 0;   // 0 = full 2D box / 1 = corners only / 2 = translucent fill
+    public static int CreatureEspStyle = 0; // 0 corners / 1 2D box / 2 silhouette / 3 label
+    public static int CrosshairStyle = 0;   // 0 = cross / 1 = dot
+    public static float CrosshairLen = 7f;  // crosshair tick length
+    public static float CrosshairGap = 5f;  // crosshair center gap
+    public static float ItemEspDist = 150f; // item label max distance
+    public static float SilentAimHeight = 0.45f; // silent aim impact height (0 feet - 1 head)
+    public static float EspBoxAlpha = 0.70f;     // player box outline alpha
+    public static float EspFillAlpha = 0.08f;    // player box fill alpha
+    public static float CreatureEspAlpha = 0.70f;  // creature outline alpha
+    public static float CreatureFillAlpha = 0.07f; // creature fill alpha
+    public static float ItemEspAlpha = 0.62f;      // item outline alpha
+    public static float ItemFillAlpha = 0.14f;     // item fill alpha
     public static bool BoatFlight;       // W/A/S/D + Space/Ctrl, bow follows view
     public static bool PlayerFlight;     // Space/Ctrl flight; yields while driving
     public static bool ThirdPerson;      // camera behind the player
     public static float ThirdPersonDist = 3f;
     public static float FovMult = 1f;    // camera FOV multiplier
     public static bool IslandLabels;     // all islands direction + distance on screen
+    public static bool SlotPredict;      // slot machine prediction HUD
+    public static int SlotCheatRarity;   // 0 off / 1 rare / 2 legendary (host)
+    public static int SlotSkinItemId = -1;  // forced prize item id (-1 = none)
+    public static int SlotSkinIndex;        // forced prize skin index
+    public static bool BaitFish;         // spawn the selected creature onto the hook
+    public static bool BaitInstant;      // instant random fish on an empty underwater bait
+    public static float TpIsland = 1f;   // teleport target island (1-based)
     public static float SpeedMult = 1f;
     public static float JumpMult = 1f;
     public static float BoatMult = 1f;
@@ -706,6 +756,143 @@ public static class Features
             return;
         try { OnlineIslandManager.TpToNextIsland(prev); }
         catch (Exception e) { Loader.Log("TpToNextIsland failed: " + e); }
+    }
+
+    /// <summary>Main island count (the last build index is the mini-island scene).</summary>
+    public static int RealIslandCount()
+    {
+        try { return Mathf.Max(1, IslandManager.TotalIslands - 1); }
+        catch { return 6; }
+    }
+
+    /// <summary>
+    /// Teleport everyone to a specific island through the game's own flow
+    /// (spawns the target island scene, then moves the players) — host only.
+    /// Raw position writes don't work: the target island scene isn't loaded yet.
+    /// </summary>
+    public static bool TeleportToIsland(int island)
+    {
+        if (!IsHost)
+            return false;
+        try
+        {
+            OnlineIslandManager.TpToSpecificIsland((byte)(island - 1));
+            return true;
+        }
+        catch (Exception e)
+        {
+            Loader.Log("TeleportToIsland failed: " + e);
+            return false;
+        }
+    }
+
+    /// <summary>Teleport the local player next to another player.</summary>
+    public static bool TeleportToPlayer(Player target)
+    {
+        if (!InGame || target == null || Local.Movement == null)
+            return false;
+        try
+        {
+            Local.Movement.Teleport(target.Transform.position + Vector3.up * 1.5f);
+            return true;
+        }
+        catch (Exception e)
+        {
+            Loader.Log("TeleportToPlayer failed: " + e);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Destroy every dropped item in the world (host only). Items held by players
+    /// or stored in inventories are untouched; keepWeapons spares guns and rods.
+    /// </summary>
+    public static int ClearDroppedItems(bool keepWeapons)
+    {
+        if (!IsHost)
+            return -1;
+        int n = 0;
+        try
+        {
+            foreach (var it in UnityEngine.Object.FindObjectsByType<Item>(
+                FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+            {
+                if (it == null || it.IsDeinitializing)
+                    continue;
+
+                // dead creatures are drops too — clear them as well
+                if (it is Creature crc)
+                {
+                    try
+                    {
+                        if (crc.IsDead)
+                        {
+                            crc.Despawn(crc.gameObject);
+                            n++;
+                        }
+                    }
+                    catch { }
+                    continue;
+                }
+
+                try
+                {
+                    if (it.IsInInventory || it.Holder != null)
+                        continue;
+                    if (keepWeapons && it.Weapon != null)
+                        continue;
+                    it.Despawn(it.gameObject);
+                    n++;
+                }
+                catch { }
+            }
+        }
+        catch (Exception e)
+        {
+            Loader.Log("ClearDroppedItems failed: " + e);
+        }
+        return n;
+    }
+
+    private static float _nextBaitFish;
+
+    /// <summary>
+    /// Hook control: instant mode attaches a random spawnable fish the moment the
+    /// bait is underwater and empty; selected mode uses the creature picked in the
+    /// items tab. Host only (spawning is server authority).
+    /// </summary>
+    public static void TickBaitFish()
+    {
+        if ((!BaitFish && !BaitInstant) || !InGame || !IsHost)
+            return;
+        if (Time.unscaledTime < _nextBaitFish)
+            return;
+        try
+        {
+            var held = Local.Holding != null ? Local.Holding.HeldItem : null;
+            var rod = held as FishingRod ?? (held != null ? held.GetComponent<FishingRod>() : null);
+            if (rod == null)
+                return;
+            var bait = AccessTools.Field(typeof(FishingRod), "_bait")?.GetValue(rod) as Bait;
+            if (bait == null || bait.ItemOnBait != null || bait.ServerItemOnBait != null)
+                return;
+            if (!Bait.BaitsUnderWater.Contains(bait))
+                return;
+
+            Item prefab;
+            if (BaitFish && Selected != null && (Selected.Creature != null || Selected is Creature))
+                prefab = Selected;
+            else if (BaitInstant && ItemDb.Creatures.Count > 0)
+                prefab = ItemDb.Creatures[UnityEngine.Random.Range(0, ItemDb.Creatures.Count)];
+            else
+                return;
+
+            _nextBaitFish = Time.unscaledTime + (BaitFish ? 3f : 0.8f);
+            var fish = SpawnOne(prefab, bait.Rig.position + Vector3.up * 0.6f, Quaternion.identity);
+            if (fish != null)
+                bait.AddItemOnBait(fish);
+        }
+        catch { }
     }
 
     public static void KillBoss()

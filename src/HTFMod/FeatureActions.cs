@@ -14,8 +14,8 @@ public static class FeatureActions
         "GodMode", "FullnessLock", "KeepInventory", "PlayerFlight", "ThirdPerson",
         "SelfOneShot", "BuiltInCheats",
         "NoRecoil", "NoSpread", "InfiniteAmmo", "FastFire", "Aimbot", "PlayerEsp",
-        "PlayerSkeleton", "PlayerHealth", "Crosshair",
-        "BoatFlight", "IslandLabels", "DripSpawn",
+        "PlayerSkeleton", "PlayerHealth", "Crosshair", "SilentAim", "CreatureEsp", "ItemEsp",
+        "BoatFlight", "IslandLabels", "DripSpawn", "SlotPredict", "BaitFish", "BaitInstant",
     };
 
     public static bool Get(string id)
@@ -38,9 +38,15 @@ public static class FeatureActions
             case "PlayerSkeleton": return Features.PlayerSkeleton;
             case "PlayerHealth": return Features.PlayerHealth;
             case "Crosshair": return Features.Crosshair;
+            case "SilentAim": return Features.SilentAim;
+            case "CreatureEsp": return Features.CreatureEsp;
+            case "ItemEsp": return Features.ItemEsp;
             case "BoatFlight": return Features.BoatFlight;
             case "IslandLabels": return Features.IslandLabels;
             case "DripSpawn": return Features.DripSpawn;
+            case "SlotPredict": return Features.SlotPredict;
+            case "BaitFish": return Features.BaitFish;
+            case "BaitInstant": return Features.BaitInstant;
             default: return false;
         }
     }
@@ -119,9 +125,15 @@ public static class FeatureActions
             case "PlayerSkeleton": Features.PlayerSkeleton = v; break;
             case "PlayerHealth": Features.PlayerHealth = v; break;
             case "Crosshair": Features.Crosshair = v; break;
+            case "SilentAim": Features.SilentAim = v; break;
+            case "CreatureEsp": Features.CreatureEsp = v; break;
+            case "ItemEsp": Features.ItemEsp = v; break;
             case "BoatFlight": Features.BoatFlight = v; break;
             case "IslandLabels": Features.IslandLabels = v; break;
             case "DripSpawn": Features.DripSpawn = v; break;
+            case "SlotPredict": Features.SlotPredict = v; break;
+            case "BaitFish": Features.BaitFish = v; break;
+            case "BaitInstant": Features.BaitInstant = v; break;
         }
     }
 }
